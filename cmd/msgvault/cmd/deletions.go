@@ -126,7 +126,7 @@ Examples:
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if cancelAll && len(args) > 0 {
-			return fmt.Errorf("cannot use --all with a batch ID argument")
+			return usageErr(cmd, fmt.Errorf("cannot use --all with a batch ID argument"))
 		}
 
 		deletionsDir := filepath.Join(cfg.Data.DataDir, "deletions")
@@ -196,7 +196,7 @@ Examples:
 				fmt.Println("  (none)")
 			}
 			fmt.Println()
-			return fmt.Errorf("provide a batch ID or use --all")
+			return usageErr(cmd, fmt.Errorf("provide a batch ID or use --all"))
 		}
 
 		batchID := args[0]
@@ -415,11 +415,11 @@ Examples:
 			}
 
 			if len(accounts) == 0 {
-				return fmt.Errorf("no account in deletion manifest - use --account flag")
+				return usageErr(cmd, fmt.Errorf("no account in deletion manifest - use --account flag"))
 			} else if len(accounts) == 1 {
 				account = accounts[0]
 			} else {
-				return fmt.Errorf("multiple accounts in pending batches (%v) - use --account flag to specify which account", accounts)
+				return usageErr(cmd, fmt.Errorf("multiple accounts in pending batches (%v) - use --account flag to specify which account", accounts))
 			}
 		} else {
 			// Resolve the user-supplied value to a source.

@@ -43,7 +43,7 @@ Examples:
 		email := args[0]
 
 		if headless && forceReauth {
-			return fmt.Errorf("--headless and --force cannot be used together: --force requires browser-based OAuth which is not available in headless mode")
+			return usageErr(cmd, fmt.Errorf("--headless and --force cannot be used together: --force requires browser-based OAuth which is not available in headless mode"))
 		}
 
 		// Resolve which client secrets to use
@@ -95,7 +95,7 @@ Examples:
 		saKeyPath := cfg.OAuth.ServiceAccountKeyFor(resolvedApp)
 		if headless {
 			if saKeyPath != "" {
-				return fmt.Errorf("service accounts do not use --headless; run add-account without --headless")
+				return usageErr(cmd, fmt.Errorf("service accounts do not use --headless; run add-account without --headless"))
 			}
 			oauth.PrintHeadlessInstructions(email, cfg.TokensDir(), resolvedApp)
 			return nil
@@ -104,7 +104,7 @@ Examples:
 		// Check for service account configuration first
 		if saKeyPath != "" {
 			if forceReauth {
-				return fmt.Errorf("service accounts do not use --force; tokens are minted on demand from the configured service account key")
+				return usageErr(cmd, fmt.Errorf("service accounts do not use --force; tokens are minted on demand from the configured service account key"))
 			}
 			saMgr, saErr := oauth.NewServiceAccountManager(saKeyPath, oauth.Scopes)
 			if saErr != nil {
