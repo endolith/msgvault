@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -208,7 +209,86 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
+	// Enrich results with keyword-in-context snippets
+	if len(results) > 0 && len(q.TextTerms) > 0 {
+		type enrichedResult struct {
+			query.MessageSummary
+			ContextSnippets []string `json:"context_snippets,omitempty"`
+		}
+		enriched := make([]enrichedResult, 0, len(results))
+		for _, r := range results {
+			er := enrichedResult{MessageSummary: r}
+			msg, err := h.engine.GetMessage(ctx, r.ID)
+			if err == nil && msg != nil {
+				er.ContextSnippets = extractContext(msg.BodyText, q.TextTerms, 2)
+			}
+			enriched = append(enriched, er)
+		}
+		return jsonResult(enriched)
+	}
+
 	return jsonResult(results)
+}
+
+// extractContext finds search terms in body text and returns surrounding context lines.
+func extractContext(body string, terms []string, contextLines int) []string {
+	if body == "" || len(terms) == 0 {
+		return nil
+	}
+	lines := strings.Split(body, "\n")
+	matched := make(map[int]bool)
+	var order []int
+
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		lower := strings.ToLower(term)
+		for i, line := range lines {
+			if !matched[i] && strings.Contains(strings.ToLower(line), lower) {
+				start := i - contextLines
+				if start < 0 {
+					start = 0
+				}
+				end := i + contextLines + 1
+				if end > len(lines) {
+					end = len(lines)
+				}
+				for j := start; j < end; j++ {
+					if !matched[j] {
+						matched[j] = true
+						order = append(order, j)
+					}
+				}
+			}
+		}
+	}
+
+	if len(order) == 0 {
+		return nil
+	}
+
+	sort.Ints(order)
+	var snippets []string
+	var buf strings.Builder
+	prev := -2
+	for _, idx := range order {
+		if prev >= 0 && idx > prev+1 {
+			snippets = append(snippets, buf.String())
+			buf.Reset()
+		}
+		line := lines[idx]
+		if len(line) > 300 {
+			line = line[:300] + "..."
+		}
+		buf.WriteString(line)
+		buf.WriteString("\n")
+		prev = idx
+	}
+	if buf.Len() > 0 {
+		snippets = append(snippets, buf.String())
+	}
+	return snippets
 }
 
 // hybridScoreBreakdown exposes fused-score components for debugging.
@@ -537,6 +617,28 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
+
+	return jsonResult(msg)
+}
+
+func (h *handlers) getMessagePreview(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	id, err := getIDArg(args, "id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	msg, err := h.engine.GetMessage(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+
+	const maxPreview = 2000
+	if len(msg.BodyText) > maxPreview {
+		msg.BodyText = msg.BodyText[:maxPreview] + "\n\n[...truncated]"
+	}
+	msg.BodyHTML = ""
 
 	return jsonResult(msg)
 }
