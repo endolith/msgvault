@@ -213,6 +213,7 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	if len(results) > 0 && len(q.TextTerms) > 0 {
 		type enrichedResult struct {
 			query.MessageSummary
+
 			ContextSnippets []string `json:"context_snippets,omitempty"`
 		}
 		enriched := make([]enrichedResult, 0, len(results))
@@ -247,13 +248,9 @@ func extractContext(body string, terms []string, contextLines int) []string {
 		for i, line := range lines {
 			if !matched[i] && strings.Contains(strings.ToLower(line), lower) {
 				start := i - contextLines
-				if start < 0 {
-					start = 0
-				}
+				start = max(start, 0)
 				end := i + contextLines + 1
-				if end > len(lines) {
-					end = len(lines)
-				}
+				end = min(end, len(lines))
 				for j := start; j < end; j++ {
 					if !matched[j] {
 						matched[j] = true
