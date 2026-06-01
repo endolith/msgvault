@@ -27,6 +27,7 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
+	ToolGetMessagePreview   = "get_message_preview"
 )
 
 // Common argument helpers for recurring tool option definitions.
@@ -107,6 +108,7 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	s.AddTool(searchMessagesTool(vectorAvailable), h.searchMessages)
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
+	s.AddTool(getMessagePreviewTool(), h.getMessagePreview)
 	s.AddTool(exportAttachmentTool(), h.exportAttachment)
 	s.AddTool(listMessagesTool(), h.listMessages)
 	s.AddTool(getStatsTool(), h.getStats)
@@ -252,6 +254,17 @@ func exportAttachmentTool() mcp.Tool {
 		),
 		mcp.WithString("destination",
 			mcp.Description("Directory to save the file to (default: ~/Downloads)"),
+		),
+	)
+}
+
+func getMessagePreviewTool() mcp.Tool {
+	return mcp.NewTool(ToolGetMessagePreview,
+		mcp.WithDescription("Get a preview of a message: headers + truncated body text (first ~2000 chars). Lighter than get_message."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithNumber("id",
+			mcp.Required(),
+			mcp.Description("Message ID"),
 		),
 	)
 }
