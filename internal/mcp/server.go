@@ -27,7 +27,7 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
-	ToolGetMessagePreview  = "get_message_preview"
+	ToolGetMessagePreview   = "get_message_preview"
 )
 
 // Common argument helpers for recurring tool option definitions.
@@ -257,7 +257,6 @@ func exportAttachmentTool() mcp.Tool {
 		),
 	)
 }
-
 
 func getMessagePreviewTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessagePreview,
