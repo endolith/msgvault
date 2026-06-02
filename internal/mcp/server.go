@@ -27,7 +27,8 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
-	ToolGetMessagePreview   = "get_message_preview"
+	ToolSearchInMessage     = "search_in_message"
+	ToolGetMessageAround    = "get_message_around"
 )
 
 // Common argument helpers for recurring tool option definitions.
@@ -108,7 +109,8 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	s.AddTool(searchMessagesTool(vectorAvailable), h.searchMessages)
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
-	s.AddTool(getMessagePreviewTool(), h.getMessagePreview)
+	s.AddTool(searchInMessageTool(), h.searchInMessage)
+	s.AddTool(getMessageAroundTool(), h.getMessageAround)
 	s.AddTool(exportAttachmentTool(), h.exportAttachment)
 	s.AddTool(listMessagesTool(), h.listMessages)
 	s.AddTool(getStatsTool(), h.getStats)
@@ -225,11 +227,17 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 
 func getMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessage,
-		mcp.WithDescription("Get full message details including body text, recipients, labels, and attachments by message ID."),
+		mcp.WithDescription("Get message details including recipients, labels, attachments, and a paginated slice of body text (HTML omitted). Use offset to read later portions of long bodies."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),
 			mcp.Description("Message ID"),
+		),
+		mcp.WithNumber("offset",
+			mcp.Description("Character offset into body_text to start reading (default 0)"),
+		),
+		mcp.WithNumber("max_chars",
+			mcp.Description("Maximum body_text characters to return (default 2000)"),
 		),
 	)
 }
@@ -258,13 +266,39 @@ func exportAttachmentTool() mcp.Tool {
 	)
 }
 
-func getMessagePreviewTool() mcp.Tool {
-	return mcp.NewTool(ToolGetMessagePreview,
-		mcp.WithDescription("Get a preview of a message: headers + truncated body text (first ~2000 chars). Lighter than get_message."),
+func searchInMessageTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchInMessage,
+		mcp.WithDescription("Search for a term within one message body. Returns match positions with line numbers and snippets, paginated."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),
 			mcp.Description("Message ID"),
+		),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Term to find in the message body"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum matches to return (default 10)"),
+		),
+		withOffset(),
+	)
+}
+
+func getMessageAroundTool() mcp.Tool {
+	return mcp.NewTool(ToolGetMessageAround,
+		mcp.WithDescription("Find a phrase in a message body and return generous context around the match. If not found, returns an error and the first 500 characters of the body."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithNumber("id",
+			mcp.Required(),
+			mcp.Description("Message ID"),
+		),
+		mcp.WithString("phrase",
+			mcp.Required(),
+			mcp.Description("Phrase to locate in the message body"),
+		),
+		mcp.WithNumber("context_chars",
+			mcp.Description("Total characters of context around the match (default 3000)"),
 		),
 	)
 }
@@ -287,6 +321,9 @@ func listMessagesTool() mcp.Tool {
 		withBefore(),
 		mcp.WithBoolean("has_attachment",
 			mcp.Description("Only messages with attachments"),
+		),
+		mcp.WithNumber("conversation_id",
+			mcp.Description("Filter by conversation/thread ID"),
 		),
 		withLimit("20"),
 		withOffset(),
