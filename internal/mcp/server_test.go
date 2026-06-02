@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
@@ -46,6 +47,40 @@ type attachmentMeta struct {
 	Filename string `json:"filename"`
 	MimeType string `json:"mime_type"`
 	Size     int64  `json:"size"`
+}
+
+type paginatedSearchMessages struct {
+	Data         []searchMessageRow `json:"data"`
+	Total        int64              `json:"total"`
+	TotalMatched int64              `json:"total_matched"`
+	Returned     int                `json:"returned"`
+	Offset       int                `json:"offset"`
+	HasMore      bool               `json:"has_more"`
+}
+
+type searchMessageRow struct {
+	query.MessageSummary
+	ContextSnippets   []string `json:"context_snippets"`
+	SnippetsTruncated bool     `json:"snippets_truncated"`
+}
+
+type getMessageResp struct {
+	ID             int64  `json:"id"`
+	Subject        string `json:"subject"`
+	BodyText       string `json:"body_text"`
+	BodyHTML       string `json:"body_html"`
+	BodyLength     int    `json:"body_length"`
+	Offset         int    `json:"offset"`
+	HasMore        bool   `json:"has_more"`
+	ConversationID int64  `json:"conversation_id"`
+}
+
+type paginatedInMessageMatches struct {
+	Data     []inMessageMatch `json:"data"`
+	Total    int64            `json:"total"`
+	Returned int              `json:"returned"`
+	Offset   int              `json:"offset"`
+	HasMore  bool             `json:"has_more"`
 }
 
 // newTestHandlers creates a handlers instance with the given mock engine.
@@ -93,16 +128,21 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 func TestSearchMessages(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
-			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").Build(),
+			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").WithConversationID(99).Build(),
+		},
+		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
 
 	t.Run("valid query", func(t *testing.T) {
-		msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
-		requirepkg.Len(t, msgs, 1, "msgs")
-		assertpkg.Equal(t, "Hello", msgs[0].Subject, "subject")
-		assertpkg.Equal(t, "thread-abc", msgs[0].SourceConversationID, "SourceConversationID")
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
+		requirepkg.Len(t, resp.Data, 1, "data")
+		assertpkg.Equal(t, "Hello", resp.Data[0].Subject, "subject")
+		assertpkg.Equal(t, "thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
+		assertpkg.Equal(t, int64(99), resp.Data[0].ConversationID, "conversation_id")
+		assertpkg.Equal(t, int64(1), resp.TotalMatched, "total_matched")
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -110,18 +150,40 @@ func TestSearchMessages(t *testing.T) {
 	})
 }
 
-func TestSearchFallbackToFTS(t *testing.T) {
+func TestSearchFTSFirstThenFastFallback(t *testing.T) {
 	eng := &querytest.MockEngine{
-		SearchFastResults: nil, // fast returns nothing
+		SearchFastResults: []query.MessageSummary{
+			testutil.NewMessageSummary(3).WithSubject("Fast only").Build(),
+		},
 		SearchResults: []query.MessageSummary{
 			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
+		},
+		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
 
-	msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
-	requirepkg.Len(t, msgs, 1, "FTS fallback msgs")
-	assertpkg.Equal(t, int64(2), msgs[0].ID, "FTS fallback ID")
+	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
+	requirepkg.Len(t, resp.Data, 1, "FTS-first msgs")
+	assertpkg.Equal(t, int64(2), resp.Data[0].ID, "FTS-first ID")
+}
+
+func TestSearchFallbackToFastWhenFTSEmpty(t *testing.T) {
+	eng := &querytest.MockEngine{
+		SearchResults: nil,
+		SearchFastResults: []query.MessageSummary{
+			testutil.NewMessageSummary(3).WithSubject("Fast fallback").Build(),
+		},
+		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
+		},
+	}
+	h := newTestHandlers(eng)
+
+	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
+	requirepkg.Len(t, resp.Data, 1, "fast fallback msgs")
+	assertpkg.Equal(t, int64(3), resp.Data[0].ID, "fast fallback ID")
 }
 
 func TestSearchMessages_HybridModeNotConfigured(t *testing.T) {
@@ -318,9 +380,43 @@ func TestGetMessage(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("found", func(t *testing.T) {
-		msg := runTool[query.MessageDetail](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
+		msg := runTool[getMessageResp](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
 		assertpkg.Equal(t, "Test Message", msg.Subject, "subject")
-		assertpkg.Equal(t, "thread-xyz", msg.SourceConversationID, "SourceConversationID")
+		assertpkg.Equal(t, "Hello world", msg.BodyText, "body_text")
+		assertpkg.Equal(t, "", msg.BodyHTML, "body_html stripped")
+		assertpkg.Equal(t, 11, msg.BodyLength, "body_length")
+		assertpkg.False(t, msg.HasMore, "has_more")
+	})
+
+	t.Run("truncates long body", func(t *testing.T) {
+		longBody := strings.Repeat("x", 5000)
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				50: testutil.NewMessageDetail(50).WithBodyText(longBody).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{"id": float64(50)})
+		assertpkg.Equal(t, 5000, msg.BodyLength, "body_length")
+		assertpkg.Len(t, msg.BodyText, 2000, "truncated body_text")
+		assertpkg.True(t, msg.HasMore, "has_more")
+	})
+
+	t.Run("offset pagination", func(t *testing.T) {
+		body := strings.Repeat("a", 3000)
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				51: testutil.NewMessageDetail(51).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{
+			"id":     float64(51),
+			"offset": float64(2000),
+		})
+		assertpkg.Equal(t, 2000, msg.Offset, "offset")
+		assertpkg.Len(t, msg.BodyText, 1000, "second page length")
+		assertpkg.False(t, msg.HasMore, "has_more")
 	})
 
 	errorCases := []struct {
@@ -937,11 +1033,14 @@ func TestAccountFilter(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("search with valid account", func(t *testing.T) {
-		msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{
+		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
+		}
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{
 			"query":   "test",
 			"account": "alice@gmail.com",
 		})
-		assertpkg.Len(t, msgs, 1, "msgs")
+		assertpkg.Len(t, resp.Data, 1, "data")
 	})
 
 	t.Run("search with invalid account", func(t *testing.T) {
@@ -987,12 +1086,68 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("empty account means no filter", func(t *testing.T) {
 		// Empty string should not filter - return all results
-		msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{
+		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
+		}
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{
 			"query":   "test",
 			"account": "",
 		})
-		assertpkg.Len(t, msgs, 1, "msgs")
+		assertpkg.Len(t, resp.Data, 1, "data")
 	})
+}
+
+func TestSearchInMessage(t *testing.T) {
+	body := "line one\nline two has the resistor value should be 5.1k ohms\nline three"
+	eng := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{
+			10: testutil.NewMessageDetail(10).WithBodyText(body).BuildPtr(),
+		},
+	}
+	h := newTestHandlers(eng)
+
+	resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+		"id":    float64(10),
+		"query": "resistor",
+	})
+	requirepkg.Len(t, resp.Data, 1, "matches")
+	assertpkg.Equal(t, 2, resp.Data[0].Line, "line")
+}
+
+func TestGetMessageAround(t *testing.T) {
+	body := strings.Repeat("a", 100) + "5.1k ohm resistor" + strings.Repeat("z", 100)
+	eng := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{
+			20: testutil.NewMessageDetail(20).WithBodyText(body).BuildPtr(),
+		},
+	}
+	h := newTestHandlers(eng)
+
+	resp := runTool[struct {
+		Phrase   string `json:"phrase"`
+		BodyText string `json:"body_text"`
+	}](t, "get_message_around", h.getMessageAround, map[string]any{
+		"id":     float64(20),
+		"phrase": "5.1k ohm",
+	})
+	assertpkg.Contains(t, resp.BodyText, "5.1k ohm", "context includes phrase")
+}
+
+func TestListMessagesConversationID(t *testing.T) {
+	var captured query.MessageFilter
+	eng := &querytest.MockEngine{
+		ListMessagesFunc: func(_ context.Context, f query.MessageFilter) ([]query.MessageSummary, error) {
+			captured = f
+			return nil, nil
+		},
+	}
+	h := newTestHandlers(eng)
+
+	runTool[[]query.MessageSummary](t, "list_messages", h.listMessages, map[string]any{
+		"conversation_id": float64(42),
+	})
+	requirepkg.NotNil(t, captured.ConversationID, "conversation_id filter")
+	assertpkg.Equal(t, int64(42), *captured.ConversationID, "conversation_id value")
 }
 
 // stageDeletionResponse matches the JSON response from stageDeletion.
