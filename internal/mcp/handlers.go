@@ -24,7 +24,45 @@ import (
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 )
 
-const maxLimit = 1000
+const (
+	maxLimit               = 1000
+	maxSearchMessagesLimit = 50
+	defaultSearchLimit     = 20
+	maxContextSnippets     = 5
+	defaultBodyChars       = 2000
+)
+
+type paginatedResponse[T any] struct {
+	Data         []T   `json:"data"`
+	Total        int64 `json:"total"`
+	TotalMatched int64 `json:"total_matched,omitempty"`
+	Returned     int   `json:"returned"`
+	Offset       int   `json:"offset"`
+	HasMore      bool  `json:"has_more"`
+}
+
+func newPaginatedResponse[T any](data []T, total int64, offset int) paginatedResponse[T] {
+	if data == nil {
+		data = []T{}
+	}
+	returned := len(data)
+	return paginatedResponse[T]{
+		Data:         data,
+		Total:        total,
+		TotalMatched: total,
+		Returned:     returned,
+		Offset:       offset,
+		HasMore:      int64(offset+returned) < total,
+	}
+}
+
+func searchLimitArg(args map[string]any) int {
+	limit := limitArg(args, "limit", defaultSearchLimit)
+	if limit > maxSearchMessagesLimit {
+		return maxSearchMessagesLimit
+	}
+	return limit
+}
 
 type handlers struct {
 	engine         query.Engine
@@ -178,10 +216,9 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 		), nil
 	}
 
-	limit := limitArg(args, "limit", 20)
+	limit := searchLimitArg(args)
 	offset := limitArg(args, "offset", 0)
 
-	// Look up account filter
 	account, _ := args["account"].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
@@ -195,40 +232,49 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 
 	filter := query.MessageFilter{SourceID: sourceID}
 
-	// Try fast search first (metadata only), fall back to full FTS.
-	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-	}
-
-	// If fast search returns nothing and query has free text, try full FTS.
-	if len(results) == 0 && len(q.TextTerms) > 0 {
+	var results []query.MessageSummary
+	if len(q.TextTerms) > 0 {
 		results, err = h.engine.Search(ctx, q, limit, offset)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 		}
 	}
-
-	// Enrich results with keyword-in-context snippets
-	if len(results) > 0 && len(q.TextTerms) > 0 {
-		type enrichedResult struct {
-			query.MessageSummary
-
-			ContextSnippets []string `json:"context_snippets,omitempty"`
+	if len(results) == 0 {
+		results, err = h.engine.SearchFast(ctx, q, filter, limit, offset)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 		}
-		enriched := make([]enrichedResult, 0, len(results))
-		for _, r := range results {
-			er := enrichedResult{MessageSummary: r}
-			msg, err := h.engine.GetMessage(ctx, r.ID)
-			if err == nil && msg != nil {
-				er.ContextSnippets = extractContext(msg.BodyText, q.TextTerms, 2)
-			}
-			enriched = append(enriched, er)
-		}
-		return jsonResult(enriched)
 	}
 
-	return jsonResult(results)
+	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search count failed: %v", err)), nil
+	}
+
+	type searchMessageItem struct {
+		query.MessageSummary
+		ContextSnippets   []string `json:"context_snippets,omitempty"`
+		SnippetsTruncated bool     `json:"snippets_truncated,omitempty"`
+	}
+
+	data := make([]searchMessageItem, 0, len(results))
+	for _, r := range results {
+		item := searchMessageItem{MessageSummary: r}
+		if len(q.TextTerms) > 0 {
+			msg, err := h.engine.GetMessage(ctx, r.ID)
+			if err == nil && msg != nil {
+				snippets := extractContext(msg.BodyText, q.TextTerms, 2)
+				if len(snippets) > maxContextSnippets {
+					item.SnippetsTruncated = true
+					snippets = snippets[:maxContextSnippets]
+				}
+				item.ContextSnippets = snippets
+			}
+		}
+		data = append(data, item)
+	}
+
+	return jsonResult(newPaginatedResponse(data, totalMatched, offset))
 }
 
 // extractContext finds search terms in body text and returns surrounding context lines.
@@ -602,6 +648,32 @@ func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[strin
 	return f, nil
 }
 
+type getMessageResponse struct {
+	ID                   int64                  `json:"id"`
+	SourceMessageID      string                 `json:"source_message_id"`
+	ConversationID       int64                  `json:"conversation_id"`
+	SourceConversationID string                 `json:"source_conversation_id"`
+	Subject              string                 `json:"subject"`
+	MessageType          string                 `json:"message_type,omitempty"`
+	Snippet              string                 `json:"snippet"`
+	SentAt               time.Time              `json:"sent_at"`
+	ReceivedAt           *time.Time             `json:"received_at,omitempty"`
+	DeletedAt            *time.Time             `json:"deleted_at,omitempty"`
+	SizeEstimate         int64                  `json:"size_estimate"`
+	HasAttachments       bool                   `json:"has_attachments"`
+	From                 []query.Address        `json:"from"`
+	To                   []query.Address        `json:"to"`
+	Cc                   []query.Address        `json:"cc"`
+	Bcc                  []query.Address        `json:"bcc"`
+	BodyText             string                 `json:"body_text"`
+	BodyHTML             string                 `json:"body_html"`
+	BodyLength           int                    `json:"body_length"`
+	Offset               int                    `json:"offset"`
+	HasMore              bool                   `json:"has_more"`
+	Labels               []string               `json:"labels"`
+	Attachments          []query.AttachmentInfo `json:"attachments"`
+}
+
 func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
@@ -615,10 +687,56 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
 
-	return jsonResult(msg)
+	bodyOffset := intArg(args, "offset", 0)
+	maxChars := limitArg(args, "max_chars", defaultBodyChars)
+	if maxChars <= 0 {
+		maxChars = defaultBodyChars
+	}
+
+	fullBody := msg.BodyText
+	bodyLen := len(fullBody)
+	if bodyOffset > bodyLen {
+		bodyOffset = bodyLen
+	}
+	end := bodyOffset + maxChars
+	if end > bodyLen {
+		end = bodyLen
+	}
+
+	return jsonResult(getMessageResponse{
+		ID:                   msg.ID,
+		SourceMessageID:      msg.SourceMessageID,
+		ConversationID:       msg.ConversationID,
+		SourceConversationID: msg.SourceConversationID,
+		Subject:              msg.Subject,
+		MessageType:          msg.MessageType,
+		Snippet:              msg.Snippet,
+		SentAt:               msg.SentAt,
+		ReceivedAt:           msg.ReceivedAt,
+		DeletedAt:            msg.DeletedAt,
+		SizeEstimate:         msg.SizeEstimate,
+		HasAttachments:       msg.HasAttachments,
+		From:                 msg.From,
+		To:                   msg.To,
+		Cc:                   msg.Cc,
+		Bcc:                  msg.Bcc,
+		BodyText:             fullBody[bodyOffset:end],
+		BodyHTML:             "",
+		BodyLength:           bodyLen,
+		Offset:               bodyOffset,
+		HasMore:              end < bodyLen,
+		Labels:               msg.Labels,
+		Attachments:          msg.Attachments,
+	})
 }
 
-func (h *handlers) getMessagePreview(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+type inMessageMatch struct {
+	CharOffset int    `json:"char_offset"`
+	Snippet    string `json:"snippet"`
+	Line       int    `json:"line"`
+}
+
+func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
 	id, err := getIDArg(args, "id")
@@ -626,18 +744,135 @@ func (h *handlers) getMessagePreview(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	queryStr, _ := args["query"].(string)
+	queryStr = strings.TrimSpace(queryStr)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := limitArg(args, "limit", 10)
+	offset := limitArg(args, "offset", 0)
+
 	msg, err := h.engine.GetMessage(ctx, id)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
 
-	const maxPreview = 2000
-	if len(msg.BodyText) > maxPreview {
-		msg.BodyText = msg.BodyText[:maxPreview] + "\n\n[...truncated]"
+	allMatches := findTermMatches(msg.BodyText, queryStr)
+	total := int64(len(allMatches))
+	if offset >= len(allMatches) {
+		return jsonResult(newPaginatedResponse([]inMessageMatch{}, total, offset))
 	}
-	msg.BodyHTML = ""
+	end := offset + limit
+	if end > len(allMatches) {
+		end = len(allMatches)
+	}
+	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
+}
 
-	return jsonResult(msg)
+func findTermMatches(body, term string) []inMessageMatch {
+	if body == "" || term == "" {
+		return nil
+	}
+	lowerTerm := strings.ToLower(term)
+	lines := strings.Split(body, "\n")
+	var matches []inMessageMatch
+	byteOffset := 0
+	for lineNum, line := range lines {
+		lowerLine := strings.ToLower(line)
+		searchFrom := 0
+		for {
+			idx := strings.Index(lowerLine[searchFrom:], lowerTerm)
+			if idx < 0 {
+				break
+			}
+			pos := searchFrom + idx
+			snippet := line
+			if len(snippet) > 300 {
+				snippet = snippet[:300] + "..."
+			}
+			matches = append(matches, inMessageMatch{
+				CharOffset: byteOffset + pos,
+				Snippet:    snippet,
+				Line:       lineNum + 1,
+			})
+			searchFrom = pos + len(term)
+		}
+		byteOffset += len(line) + 1
+	}
+	return matches
+}
+
+type getMessageAroundResponse struct {
+	ID           int64  `json:"id"`
+	Phrase       string `json:"phrase"`
+	CharOffset   int    `json:"char_offset"`
+	BodyText     string `json:"body_text"`
+	ContextChars int    `json:"context_chars"`
+	BodyLength   int    `json:"body_length"`
+}
+
+type getMessageAroundNotFound struct {
+	Error      string `json:"error"`
+	ID         int64  `json:"id"`
+	Phrase     string `json:"phrase"`
+	BodyText   string `json:"body_text"`
+	BodyLength int    `json:"body_length"`
+}
+
+func (h *handlers) getMessageAround(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	id, err := getIDArg(args, "id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	phrase, _ := args["phrase"].(string)
+	phrase = strings.TrimSpace(phrase)
+	if phrase == "" {
+		return mcp.NewToolResultError("phrase parameter is required"), nil
+	}
+
+	contextChars := limitArg(args, "context_chars", 3000)
+	if contextChars <= 0 {
+		contextChars = 3000
+	}
+
+	msg, err := h.engine.GetMessage(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+
+	body := msg.BodyText
+	bodyLen := len(body)
+	charOffset := strings.Index(strings.ToLower(body), strings.ToLower(phrase))
+	if charOffset < 0 {
+		previewLen := min(500, bodyLen)
+		return jsonResult(getMessageAroundNotFound{
+			Error:      fmt.Sprintf("phrase %q not found in message body", phrase),
+			ID:         id,
+			Phrase:     phrase,
+			BodyText:   body[:previewLen],
+			BodyLength: bodyLen,
+		})
+	}
+
+	half := (contextChars - len(phrase)) / 2
+	if half < 0 {
+		half = 0
+	}
+	start := max(charOffset-half, 0)
+	end := min(charOffset+len(phrase)+half, bodyLen)
+
+	return jsonResult(getMessageAroundResponse{
+		ID:           id,
+		Phrase:       phrase,
+		CharOffset:   charOffset,
+		BodyText:     body[start:end],
+		ContextChars: contextChars,
+		BodyLength:   bodyLen,
+	})
 }
 
 const maxAttachmentSize = 50 * 1024 * 1024 // 50MB
@@ -825,6 +1060,10 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 	if filter.Before, err = getDateArg(args, "before"); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if v, ok := args["conversation_id"].(float64); ok && v != 0 {
+		v2 := int64(v)
+		filter.ConversationID = &v2
+	}
 
 	results, err := h.engine.ListMessages(ctx, filter)
 	if err != nil {
@@ -919,6 +1158,19 @@ func (h *handlers) aggregate(ctx context.Context, req mcp.CallToolRequest) (*mcp
 // limitArg extracts a non-negative integer limit from a map, with a default.
 // JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
 // result sets.
+// intArg extracts a non-negative integer from args without the maxLimit clamp
+// used by limitArg. Suitable for body-text offsets and similar unbounded values.
+func intArg(args map[string]any, key string, def int) int {
+	v, ok := args[key].(float64)
+	if !ok {
+		return def
+	}
+	if math.IsNaN(v) || v < 0 || math.IsInf(v, 1) || v > float64(math.MaxInt) {
+		return def
+	}
+	return int(v)
+}
+
 func limitArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
