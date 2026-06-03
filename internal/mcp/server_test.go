@@ -137,12 +137,14 @@ func TestSearchMessages(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("valid query", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
-		requirepkg.Len(t, resp.Data, 1, "data")
-		assertpkg.Equal(t, "Hello", resp.Data[0].Subject, "subject")
-		assertpkg.Equal(t, "thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
-		assertpkg.Equal(t, int64(99), resp.Data[0].ConversationID, "conversation_id")
-		assertpkg.Equal(t, int64(1), resp.TotalMatched, "total_matched")
+		require.Len(resp.Data, 1, "data")
+		assert.Equal("Hello", resp.Data[0].Subject, "subject")
+		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
+		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
+		assert.Equal(int64(1), resp.TotalMatched, "total_matched")
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -380,12 +382,13 @@ func TestGetMessage(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("found", func(t *testing.T) {
+		assert := assertpkg.New(t)
 		msg := runTool[getMessageResp](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
-		assertpkg.Equal(t, "Test Message", msg.Subject, "subject")
-		assertpkg.Equal(t, "Hello world", msg.BodyText, "body_text")
-		assertpkg.Equal(t, "", msg.BodyHTML, "body_html stripped")
-		assertpkg.Equal(t, 11, msg.BodyLength, "body_length")
-		assertpkg.False(t, msg.HasMore, "has_more")
+		assert.Equal("Test Message", msg.Subject, "subject")
+		assert.Equal("Hello world", msg.BodyText, "body_text")
+		assert.Equal("", msg.BodyHTML, "body_html stripped")
+		assert.Equal(11, msg.BodyLength, "body_length")
+		assert.False(msg.HasMore, "has_more")
 	})
 
 	t.Run("truncates long body", func(t *testing.T) {
