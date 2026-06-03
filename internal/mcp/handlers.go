@@ -29,7 +29,9 @@ const (
 	maxSearchMessagesLimit = 50
 	defaultSearchLimit     = 20
 	maxContextSnippets     = 5
-	defaultBodyChars       = 2000
+	// searchContextChars is the max byte length of each context_snippets entry in search_messages.
+	searchContextChars = 300
+	defaultBodyChars   = 2000
 )
 
 type paginatedResponse[T any] struct {
@@ -264,7 +266,7 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 		if len(q.TextTerms) > 0 {
 			msg, err := h.engine.GetMessage(ctx, r.ID)
 			if err == nil && msg != nil {
-				snippets := extractContext(msg.BodyText, q.TextTerms, 2)
+				snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
 				if len(snippets) > maxContextSnippets {
 					item.SnippetsTruncated = true
 					snippets = snippets[:maxContextSnippets]
@@ -278,61 +280,74 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	return jsonResult(newPaginatedResponse(data, totalMatched, offset))
 }
 
-// extractContext finds search terms in body text and returns surrounding context lines.
-func extractContext(body string, terms []string, contextLines int) []string {
-	if body == "" || len(terms) == 0 {
+// extractContextChar returns up to contextChars of body text centered on each
+// case-insensitive term match, merging overlapping windows.
+func extractContextChar(body string, terms []string, contextChars int) []string {
+	if body == "" || len(terms) == 0 || contextChars <= 0 {
 		return nil
 	}
-	lines := strings.Split(body, "\n")
-	matched := make(map[int]bool)
-	var order []int
+
+	lowerBody := strings.ToLower(body)
+
+	type span struct {
+		start, end int
+	}
+	var spans []span
 
 	for _, term := range terms {
 		if len(term) < 2 {
 			continue
 		}
-		lower := strings.ToLower(term)
-		for i, line := range lines {
-			if !matched[i] && strings.Contains(strings.ToLower(line), lower) {
-				start := i - contextLines
-				start = max(start, 0)
-				end := i + contextLines + 1
-				end = min(end, len(lines))
-				for j := start; j < end; j++ {
-					if !matched[j] {
-						matched[j] = true
-						order = append(order, j)
-					}
-				}
+		lowerTerm := strings.ToLower(term)
+		termLen := len(term)
+		searchFrom := 0
+		for {
+			idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+			if idx < 0 {
+				break
 			}
+			pos := searchFrom + idx
+			searchFrom = pos + 1
+
+			start := pos - (contextChars-termLen)/2
+			end := start + contextChars
+			if start < 0 {
+				start = 0
+				end = min(len(body), contextChars)
+			} else if end > len(body) {
+				end = len(body)
+				start = max(0, end-contextChars)
+			}
+			spans = append(spans, span{start: start, end: end})
 		}
 	}
 
-	if len(order) == 0 {
+	if len(spans) == 0 {
 		return nil
 	}
 
-	sort.Ints(order)
-	var snippets []string
-	var buf strings.Builder
-	prev := -2
-	for _, idx := range order {
-		if prev >= 0 && idx > prev+1 {
-			snippets = append(snippets, buf.String())
-			buf.Reset()
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end < spans[j].end
 		}
-		line := lines[idx]
-		if len(line) > 300 {
-			line = line[:300] + "..."
+		return spans[i].start < spans[j].start
+	})
+
+	merged := []span{spans[0]}
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start <= last.end {
+			last.end = max(last.end, s.end)
+			continue
 		}
-		buf.WriteString(line)
-		buf.WriteString("\n")
-		prev = idx
+		merged = append(merged, s)
 	}
-	if buf.Len() > 0 {
-		snippets = append(snippets, buf.String())
+
+	out := make([]string, 0, len(merged))
+	for _, s := range merged {
+		out = append(out, body[s.start:s.end])
 	}
-	return snippets
+	return out
 }
 
 // hybridScoreBreakdown exposes fused-score components for debugging.
