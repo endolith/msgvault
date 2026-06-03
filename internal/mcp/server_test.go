@@ -199,13 +199,15 @@ func TestExtractContextChar(t *testing.T) {
 	})
 
 	t.Run("long quoted line", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		quoted := strings.Repeat("> This is quoted history that should not bloat the snippet. ", 40)
 		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
 		snippets := extractContextChar(body, []string{"5.1k"}, 300)
-		requirepkg.Len(t, snippets, 1)
-		assertpkg.Contains(t, snippets[0], "5.1k")
-		assertpkg.LessOrEqual(t, len(snippets[0]), 300)
-		assertpkg.NotContains(t, snippets[0], strings.Repeat("> This", 10))
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.LessOrEqual(len(snippets[0]), 300)
+		assert.NotContains(snippets[0], strings.Repeat("> This", 10))
 	})
 
 	t.Run("overlapping matches merge", func(t *testing.T) {
