@@ -189,6 +189,61 @@ func TestSearchFallbackToFastWhenFTSEmpty(t *testing.T) {
 	assertpkg.Equal(t, int64(3), resp.Data[0].ID, "fast fallback ID")
 }
 
+func TestExtractContextChar(t *testing.T) {
+	t.Run("short body", func(t *testing.T) {
+		body := "The resistor value should be 5.1k ohms not 10k as previously stated."
+		snippets := extractContextChar(body, []string{"5.1k"}, 200)
+		requirepkg.Len(t, snippets, 1)
+		assertpkg.Contains(t, snippets[0], "5.1k")
+		assertpkg.LessOrEqual(t, len(snippets[0]), 200)
+	})
+
+	t.Run("long quoted line", func(t *testing.T) {
+		quoted := strings.Repeat("> This is quoted history that should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		snippets := extractContextChar(body, []string{"5.1k"}, 300)
+		requirepkg.Len(t, snippets, 1)
+		assertpkg.Contains(t, snippets[0], "5.1k")
+		assertpkg.LessOrEqual(t, len(snippets[0]), 300)
+		assertpkg.NotContains(t, snippets[0], strings.Repeat("> This", 10))
+	})
+
+	t.Run("overlapping matches merge", func(t *testing.T) {
+		body := "foo bar foo baz"
+		snippets := extractContextChar(body, []string{"foo"}, 20)
+		requirepkg.Len(t, snippets, 1)
+		assertpkg.Equal(t, body, snippets[0])
+	})
+
+	t.Run("match near start", func(t *testing.T) {
+		body := "needle" + strings.Repeat("x", 500)
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		requirepkg.Len(t, snippets, 1)
+		assertpkg.Equal(t, 100, len(snippets[0]))
+		assertpkg.Equal(t, body[:100], snippets[0])
+	})
+
+	t.Run("match near end", func(t *testing.T) {
+		body := strings.Repeat("a", 500) + "needle"
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		requirepkg.Len(t, snippets, 1)
+		assertpkg.Equal(t, 100, len(snippets[0]))
+		assertpkg.Equal(t, body[len(body)-100:], snippets[0])
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		assertpkg.Nil(t, extractContextChar("hello world", []string{"zzz"}, 300))
+	})
+
+	t.Run("empty body", func(t *testing.T) {
+		assertpkg.Nil(t, extractContextChar("", []string{"foo"}, 300))
+	})
+
+	t.Run("short term skipped", func(t *testing.T) {
+		assertpkg.Nil(t, extractContextChar("abc", []string{"a"}, 300))
+	})
+}
+
 func TestSearchMessages_HybridModeNotConfigured(t *testing.T) {
 	// Handlers constructed without a hybridEngine must reject
 	// mode=hybrid (and mode=vector) with a vector_not_enabled error.
