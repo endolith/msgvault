@@ -191,11 +191,13 @@ func TestSearchFallbackToFastWhenFTSEmpty(t *testing.T) {
 
 func TestExtractContextChar(t *testing.T) {
 	t.Run("short body", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		body := "The resistor value should be 5.1k ohms not 10k as previously stated."
 		snippets := extractContextChar(body, []string{"5.1k"}, 200)
-		requirepkg.Len(t, snippets, 1)
-		assertpkg.Contains(t, snippets[0], "5.1k")
-		assertpkg.LessOrEqual(t, len(snippets[0]), 200)
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.LessOrEqual(len(snippets[0]), 200)
 	})
 
 	t.Run("long quoted line", func(t *testing.T) {
@@ -206,43 +208,52 @@ func TestExtractContextChar(t *testing.T) {
 		snippets := extractContextChar(body, []string{"5.1k"}, 300)
 		require.Len(snippets, 1)
 		assert.Contains(snippets[0], "5.1k")
-		assert.LessOrEqual(len(snippets[0]), 300)
+		assert.Len(snippets[0], 300)
 		assert.NotContains(snippets[0], strings.Repeat("> This", 10))
 	})
 
 	t.Run("overlapping matches merge", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		body := "foo bar foo baz"
 		snippets := extractContextChar(body, []string{"foo"}, 20)
-		requirepkg.Len(t, snippets, 1)
-		assertpkg.Equal(t, body, snippets[0])
+		require.Len(snippets, 1)
+		assert.Equal(body, snippets[0])
 	})
 
 	t.Run("match near start", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		body := "needle" + strings.Repeat("x", 500)
 		snippets := extractContextChar(body, []string{"needle"}, 100)
-		requirepkg.Len(t, snippets, 1)
-		assertpkg.Equal(t, 100, len(snippets[0]))
-		assertpkg.Equal(t, body[:100], snippets[0])
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[:100], snippets[0])
 	})
 
 	t.Run("match near end", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		body := strings.Repeat("a", 500) + "needle"
 		snippets := extractContextChar(body, []string{"needle"}, 100)
-		requirepkg.Len(t, snippets, 1)
-		assertpkg.Equal(t, 100, len(snippets[0]))
-		assertpkg.Equal(t, body[len(body)-100:], snippets[0])
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[len(body)-100:], snippets[0])
 	})
 
 	t.Run("no matches", func(t *testing.T) {
-		assertpkg.Nil(t, extractContextChar("hello world", []string{"zzz"}, 300))
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("hello world", []string{"zzz"}, 300))
 	})
 
 	t.Run("empty body", func(t *testing.T) {
-		assertpkg.Nil(t, extractContextChar("", []string{"foo"}, 300))
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("", []string{"foo"}, 300))
 	})
 
 	t.Run("short term skipped", func(t *testing.T) {
-		assertpkg.Nil(t, extractContextChar("abc", []string{"a"}, 300))
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("abc", []string{"a"}, 300))
 	})
 }
 
