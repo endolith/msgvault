@@ -60,6 +60,7 @@ type paginatedSearchMessages struct {
 
 type searchMessageRow struct {
 	query.MessageSummary
+
 	ContextSnippets   []string `json:"context_snippets"`
 	SnippetsTruncated bool     `json:"snippets_truncated"`
 }
@@ -386,7 +387,7 @@ func TestGetMessage(t *testing.T) {
 		msg := runTool[getMessageResp](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
 		assert.Equal("Test Message", msg.Subject, "subject")
 		assert.Equal("Hello world", msg.BodyText, "body_text")
-		assert.Equal("", msg.BodyHTML, "body_html stripped")
+		assert.Empty(msg.BodyHTML, "body_html stripped")
 		assert.Equal(11, msg.BodyLength, "body_length")
 		assert.False(msg.HasMore, "has_more")
 	})

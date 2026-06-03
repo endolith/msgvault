@@ -253,6 +253,7 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 
 	type searchMessageItem struct {
 		query.MessageSummary
+
 		ContextSnippets   []string `json:"context_snippets,omitempty"`
 		SnippetsTruncated bool     `json:"snippets_truncated,omitempty"`
 	}
@@ -698,10 +699,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if bodyOffset > bodyLen {
 		bodyOffset = bodyLen
 	}
-	end := bodyOffset + maxChars
-	if end > bodyLen {
-		end = bodyLen
-	}
+	end := min(bodyOffset+maxChars, bodyLen)
 
 	return jsonResult(getMessageResponse{
 		ID:                   msg.ID,
@@ -763,10 +761,7 @@ func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest)
 	if offset >= len(allMatches) {
 		return jsonResult(newPaginatedResponse([]inMessageMatch{}, total, offset))
 	}
-	end := offset + limit
-	if end > len(allMatches) {
-		end = len(allMatches)
-	}
+	end := min(offset+limit, len(allMatches))
 	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
 }
 
@@ -858,10 +853,7 @@ func (h *handlers) getMessageAround(ctx context.Context, req mcp.CallToolRequest
 		})
 	}
 
-	half := (contextChars - len(phrase)) / 2
-	if half < 0 {
-		half = 0
-	}
+	half := max((contextChars-len(phrase))/2, 0)
 	start := max(charOffset-half, 0)
 	end := min(charOffset+len(phrase)+half, bodyLen)
 
