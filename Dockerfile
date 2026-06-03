@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
+# go.mod may require a newer patch than the base image ships; allow auto-fetch.
+ENV GOTOOLCHAIN=auto
+
 # Download dependencies first (layer caching)
 COPY go.mod go.sum ./
 RUN go mod download

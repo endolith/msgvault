@@ -27,7 +27,7 @@
           version = "1.26.4";
           src = pkgs.fetchurl {
             url = "https://go.dev/dl/go${version}.src.tar.gz";
-            hash = "sha256-T2aKMr+/ETLmqIgfgYwv2t2GcUkqM5IRF1+7VapCYC0=";
+            hash = "sha256-T2aKMvv8ETLmqIH7lowvHa2mMUkqM5IRc1+7JVpCYC0=";
           };
         });
 
