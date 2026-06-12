@@ -27,8 +27,8 @@ import (
 const (
 	maxLimit               = 1000
 	maxSearchMessagesLimit = 50
-	defaultSearchLimit     = 20
-	maxContextSnippets     = 5
+	defaultSearchLimit     = 10
+	maxContextSnippets     = 3
 	// searchContextChars is the max byte length of each context_snippets entry in search_messages.
 	searchContextChars = 300
 	defaultBodyChars   = 2000
