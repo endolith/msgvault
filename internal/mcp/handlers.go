@@ -280,6 +280,31 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	return jsonResult(newPaginatedResponse(data, totalMatched, offset))
 }
 
+// contextWindow returns byte offsets [start, end) for a window of up to
+// contextChars bytes centered on a match at pos with byte length termLen.
+func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
+	start = pos - (contextChars-termLen)/2
+	end = start + contextChars
+	if start < 0 {
+		start = 0
+		end = min(bodyLen, contextChars)
+	} else if end > bodyLen {
+		end = bodyLen
+		start = max(0, end-contextChars)
+	}
+	return start, end
+}
+
+func lineNumberAt(body string, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 1
+	}
+	if byteOffset > len(body) {
+		byteOffset = len(body)
+	}
+	return 1 + strings.Count(body[:byteOffset], "\n")
+}
+
 // extractContextChar returns up to contextChars of body text centered on each
 // case-insensitive term match, merging overlapping windows.
 func extractContextChar(body string, terms []string, contextChars int) []string {
@@ -309,15 +334,7 @@ func extractContextChar(body string, terms []string, contextChars int) []string 
 			pos := searchFrom + idx
 			searchFrom = pos + 1
 
-			start := pos - (contextChars-termLen)/2
-			end := start + contextChars
-			if start < 0 {
-				start = 0
-				end = min(len(body), contextChars)
-			} else if end > len(body) {
-				end = len(body)
-				start = max(0, end-contextChars)
-			}
+			start, end := contextWindow(len(body), pos, termLen, contextChars)
 			spans = append(spans, span{start: start, end: end})
 		}
 	}
@@ -811,75 +828,6 @@ func findTermMatches(body, term string) []inMessageMatch {
 		byteOffset += len(line) + 1
 	}
 	return matches
-}
-
-type getMessageAroundResponse struct {
-	ID           int64  `json:"id"`
-	Phrase       string `json:"phrase"`
-	CharOffset   int    `json:"char_offset"`
-	BodyText     string `json:"body_text"`
-	ContextChars int    `json:"context_chars"`
-	BodyLength   int    `json:"body_length"`
-}
-
-type getMessageAroundNotFound struct {
-	Error      string `json:"error"`
-	ID         int64  `json:"id"`
-	Phrase     string `json:"phrase"`
-	BodyText   string `json:"body_text"`
-	BodyLength int    `json:"body_length"`
-}
-
-func (h *handlers) getMessageAround(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-
-	id, err := getIDArg(args, "id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	phrase, _ := args["phrase"].(string)
-	phrase = strings.TrimSpace(phrase)
-	if phrase == "" {
-		return mcp.NewToolResultError("phrase parameter is required"), nil
-	}
-
-	contextChars := limitArg(args, "context_chars", 3000)
-	if contextChars <= 0 {
-		contextChars = 3000
-	}
-
-	msg, err := h.engine.GetMessage(ctx, id)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
-	}
-
-	body := msg.BodyText
-	bodyLen := len(body)
-	charOffset := strings.Index(strings.ToLower(body), strings.ToLower(phrase))
-	if charOffset < 0 {
-		previewLen := min(500, bodyLen)
-		return jsonResult(getMessageAroundNotFound{
-			Error:      fmt.Sprintf("phrase %q not found in message body", phrase),
-			ID:         id,
-			Phrase:     phrase,
-			BodyText:   body[:previewLen],
-			BodyLength: bodyLen,
-		})
-	}
-
-	half := max((contextChars-len(phrase))/2, 0)
-	start := max(charOffset-half, 0)
-	end := min(charOffset+len(phrase)+half, bodyLen)
-
-	return jsonResult(getMessageAroundResponse{
-		ID:           id,
-		Phrase:       phrase,
-		CharOffset:   charOffset,
-		BodyText:     body[start:end],
-		ContextChars: contextChars,
-		BodyLength:   bodyLen,
-	})
 }
 
 const maxAttachmentSize = 50 * 1024 * 1024 // 50MB
