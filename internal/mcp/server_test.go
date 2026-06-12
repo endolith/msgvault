@@ -1296,6 +1296,8 @@ func TestSearchInMessage(t *testing.T) {
 	})
 
 	t.Run("long quoted line", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
 		quoted := strings.Repeat("> quoted history should not bloat the snippet. ", 40)
 		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
 		eng := &querytest.MockEngine{
@@ -1309,10 +1311,10 @@ func TestSearchInMessage(t *testing.T) {
 			"id":    float64(11),
 			"query": "5.1k",
 		})
-		requirepkg.Len(t, resp.Data, 1, "matches")
-		assertpkg.Contains(t, resp.Data[0].Snippet, "5.1k")
-		assertpkg.LessOrEqual(t, len(resp.Data[0].Snippet), searchContextChars)
-		assertpkg.NotContains(t, resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
+		require.Len(resp.Data, 1, "matches")
+		assert.Contains(resp.Data[0].Snippet, "5.1k")
+		assert.LessOrEqual(len(resp.Data[0].Snippet), searchContextChars)
+		assert.NotContains(resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
 	})
 }
 
@@ -1512,6 +1514,8 @@ type fakeBackend struct {
 	activeErr   error
 	searchHits  []vector.Hit
 	searchErr   error
+	fusedHits   []vector.FusedHit
+	fusedErr    error
 	building    *vector.Generation
 	buildingErr error
 	stats       map[vector.GenerationID]vector.Stats
@@ -1526,6 +1530,24 @@ func (f *fakeBackend) ActiveGeneration(_ context.Context) (vector.Generation, er
 }
 func (f *fakeBackend) Search(_ context.Context, _ vector.GenerationID, _ []float32, _ int, _ vector.Filter) ([]vector.Hit, error) {
 	return f.searchHits, f.searchErr
+}
+func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+	if f.fusedErr != nil {
+		return nil, false, f.fusedErr
+	}
+	hits := f.fusedHits
+	if hits == nil {
+		hits = make([]vector.FusedHit, len(f.searchHits))
+		for i, h := range f.searchHits {
+			hits[i] = vector.FusedHit{
+				MessageID:   h.MessageID,
+				VectorScore: h.Score,
+				RRFScore:    h.Score,
+				BM25Score:   math.NaN(),
+			}
+		}
+	}
+	return hits, len(hits) >= req.Limit, nil
 }
 func (f *fakeBackend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, errors.New("not implemented")
@@ -1556,7 +1578,10 @@ func (f *fakeBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) err
 	return nil
 }
 
-var _ vector.Backend = (*fakeBackend)(nil)
+var (
+	_ vector.Backend       = (*fakeBackend)(nil)
+	_ vector.FusingBackend = (*fakeBackend)(nil)
+)
 
 // similarResponse matches the JSON response shape of find_similar_messages.
 type similarResponse struct {
