@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.kenn.io/msgvault/internal/deletion"
@@ -284,6 +285,35 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	return jsonResult(newPaginatedResponse(data, totalMatched, offset))
 }
 
+// bodyByteSlice returns body[start:end], nudging boundaries inward so the
+// result is always valid UTF-8. MCP body APIs use byte offsets; without
+// this, a window can split a multibyte rune (emoji, CJK, accented letters).
+func bodyByteSlice(body string, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(body) {
+		end = len(body)
+	}
+	if start >= end {
+		return ""
+	}
+	for start < end && !utf8.RuneStart(body[start]) {
+		start++
+	}
+	for end > start && end < len(body) && !utf8.RuneStart(body[end]) {
+		end--
+	}
+	for end > start {
+		s := body[start:end]
+		if utf8.ValidString(s) {
+			return s
+		}
+		end--
+	}
+	return ""
+}
+
 // contextWindow returns byte offsets [start, end) for a window of up to
 // contextChars bytes centered on a match at pos with byte length termLen.
 func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
@@ -366,7 +396,7 @@ func extractContextChar(body string, terms []string, contextChars int) []string 
 
 	out := make([]string, 0, len(merged))
 	for _, s := range merged {
-		out = append(out, body[s.start:s.end])
+		out = append(out, bodyByteSlice(body, s.start, s.end))
 	}
 	return out
 }
@@ -778,7 +808,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		To:                   msg.To,
 		Cc:                   msg.Cc,
 		Bcc:                  msg.Bcc,
-		BodyText:             fullBody[start:end],
+		BodyText:             bodyByteSlice(fullBody, start, end),
 		BodyHTML:             "",
 		BodyLength:           bodyLen,
 		Offset:               start,
@@ -844,7 +874,7 @@ func findTermMatches(body, term string) []inMessageMatch {
 		start, end := contextWindow(len(body), pos, termLen, searchContextChars)
 		matches = append(matches, inMessageMatch{
 			CharOffset: pos,
-			Snippet:    body[start:end],
+			Snippet:    bodyByteSlice(body, start, end),
 			Line:       lineNumberAt(body, pos),
 		})
 	}

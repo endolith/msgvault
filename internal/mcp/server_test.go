@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	assertpkg "github.com/stretchr/testify/assert"
@@ -187,6 +188,33 @@ func TestSearchFallbackToFastWhenFTSEmpty(t *testing.T) {
 	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
 	requirepkg.Len(t, resp.Data, 1, "fast fallback msgs")
 	assertpkg.Equal(t, int64(3), resp.Data[0].ID, "fast fallback ID")
+}
+
+func TestBodyByteSlice(t *testing.T) {
+	t.Run("ascii unchanged", func(t *testing.T) {
+		body := "hello world"
+		assertpkg.Equal(t, "hello", bodyByteSlice(body, 0, 5))
+	})
+
+	t.Run("does not split multibyte rune", func(t *testing.T) {
+		// é is 2 bytes; slice ending after first byte must drop the partial rune.
+		body := "café"
+		s := bodyByteSlice(body, 0, 4)
+		assertpkg.True(t, utf8.ValidString(s), "result must be valid UTF-8: %q", s)
+		assertpkg.Equal(t, "caf", s)
+	})
+
+	t.Run("emoji not bisected", func(t *testing.T) {
+		body := strings.Repeat("a", 10) + "😀" + strings.Repeat("b", 10)
+		emojiStart := 10
+		// Window ends inside the 4-byte emoji — must not return a broken sequence.
+		s := bodyByteSlice(body, emojiStart, emojiStart+2)
+		assertpkg.True(t, utf8.ValidString(s), "result must be valid UTF-8: %q", s)
+		// Wide enough window includes the whole emoji.
+		wide := bodyByteSlice(body, emojiStart, emojiStart+4)
+		assertpkg.True(t, utf8.ValidString(wide))
+		assertpkg.Equal(t, "😀", wide)
+	})
 }
 
 func TestExtractContextChar(t *testing.T) {
@@ -1283,7 +1311,7 @@ func TestSearchInMessage(t *testing.T) {
 		})
 		requirepkg.Len(t, resp.Data, 1, "matches")
 		assertpkg.Contains(t, resp.Data[0].Snippet, "5.1k")
-		assertpkg.Len(t, resp.Data[0].Snippet, searchContextChars)
+		assertpkg.LessOrEqual(t, len(resp.Data[0].Snippet), searchContextChars)
 		assertpkg.NotContains(t, resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
 	})
 }
