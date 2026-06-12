@@ -1170,20 +1170,43 @@ func TestAccountFilter(t *testing.T) {
 }
 
 func TestSearchInMessage(t *testing.T) {
-	body := "line one\nline two has the resistor value should be 5.1k ohms\nline three"
-	eng := &querytest.MockEngine{
-		Messages: map[int64]*query.MessageDetail{
-			10: testutil.NewMessageDetail(10).WithBodyText(body).BuildPtr(),
-		},
-	}
-	h := newTestHandlers(eng)
+	t.Run("reports line and centered snippet", func(t *testing.T) {
+		body := "line one\nline two has the resistor value should be 5.1k ohms\nline three"
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				10: testutil.NewMessageDetail(10).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
 
-	resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
-		"id":    float64(10),
-		"query": "resistor",
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(10),
+			"query": "resistor",
+		})
+		requirepkg.Len(t, resp.Data, 1, "matches")
+		assertpkg.Equal(t, 2, resp.Data[0].Line, "line")
+		assertpkg.Contains(t, resp.Data[0].Snippet, "resistor")
 	})
-	requirepkg.Len(t, resp.Data, 1, "matches")
-	assertpkg.Equal(t, 2, resp.Data[0].Line, "line")
+
+	t.Run("long quoted line", func(t *testing.T) {
+		quoted := strings.Repeat("> quoted history should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				11: testutil.NewMessageDetail(11).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(11),
+			"query": "5.1k",
+		})
+		requirepkg.Len(t, resp.Data, 1, "matches")
+		assertpkg.Contains(t, resp.Data[0].Snippet, "5.1k")
+		assertpkg.Len(t, resp.Data[0].Snippet, searchContextChars)
+		assertpkg.NotContains(t, resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
+	})
 }
 
 func TestListMessagesConversationID(t *testing.T) {
