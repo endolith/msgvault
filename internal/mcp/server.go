@@ -239,13 +239,13 @@ func getMessageTool() mcp.Tool {
 			mcp.Description("Message ID"),
 		),
 		mcp.WithNumber("offset",
-			mcp.Description("Start reading body_text from this byte offset (default 0). Ignored when center_at is provided."),
+			mcp.Description("Byte offset from the start of body_text to begin reading (default 0). Ignored when center_at is provided."),
 		),
 		mcp.WithNumber("center_at",
-			mcp.Description("Center the body_text window on this byte offset (e.g. match_offset from search_in_message). Takes precedence over offset."),
+			mcp.Description("Byte offset from the start of body_text to center the window on (e.g. match_offset from search_in_message). Takes precedence over offset."),
 		),
 		mcp.WithNumber("max_chars",
-			mcp.Description("Maximum body_text characters to return (default 2000)"),
+			mcp.Description("Maximum body_text bytes to return (default 2000, max 4000). Out-of-range values are silently replaced with the default."),
 		),
 	)
 }
