@@ -384,7 +384,9 @@ type hybridScoreBreakdown struct {
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score *hybridScoreBreakdown `json:"score,omitempty"`
+	Score             *hybridScoreBreakdown `json:"score,omitempty"`
+	ContextSnippets   []string              `json:"context_snippets,omitempty"`
+	SnippetsTruncated bool                  `json:"snippets_truncated,omitempty"`
 }
 
 // hybridGenerationSummary describes the active vector-index generation
@@ -521,6 +523,23 @@ func (h *handlers) searchMessagesHybrid(
 			item.Score = sb
 		}
 		items = append(items, item)
+	}
+
+	// Enrich each hit with context snippets. mode=vector|hybrid both require
+	// free-text terms (enforced above), so we always have terms to extract from.
+	// This requires one GetMessage call per hit to access body text; the
+	// bulk GetMessageSummariesByIDs above intentionally omits body for speed.
+	for i := range items {
+		detail, err := h.engine.GetMessage(ctx, items[i].ID)
+		if err != nil || detail == nil {
+			continue
+		}
+		snippets := extractContextChar(detail.BodyText, parsed.TextTerms, searchContextChars)
+		if len(snippets) > maxContextSnippets {
+			items[i].SnippetsTruncated = true
+			snippets = snippets[:maxContextSnippets]
+		}
+		items[i].ContextSnippets = snippets
 	}
 
 	return jsonResult(hybridSearchResponse{
@@ -720,7 +739,6 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
 
-	bodyOffset := intArg(args, "offset", 0)
 	maxChars := limitArg(args, "max_chars", defaultBodyChars)
 	if maxChars <= 0 {
 		maxChars = defaultBodyChars
@@ -728,10 +746,16 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	fullBody := msg.BodyText
 	bodyLen := len(fullBody)
-	if bodyOffset > bodyLen {
-		bodyOffset = bodyLen
+
+	var start, end int
+	if centerAt := intArg(args, "center_at", -1); centerAt >= 0 {
+		// Center the window on the given byte offset (e.g. a match_offset from
+		// search_in_message). contextWindow handles clamping to body boundaries.
+		start, end = contextWindow(bodyLen, centerAt, 0, maxChars)
+	} else {
+		start = min(intArg(args, "offset", 0), bodyLen)
+		end = min(start+maxChars, bodyLen)
 	}
-	end := min(bodyOffset+maxChars, bodyLen)
 
 	return jsonResult(getMessageResponse{
 		ID:                   msg.ID,
@@ -750,10 +774,10 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		To:                   msg.To,
 		Cc:                   msg.Cc,
 		Bcc:                  msg.Bcc,
-		BodyText:             fullBody[bodyOffset:end],
+		BodyText:             fullBody[start:end],
 		BodyHTML:             "",
 		BodyLength:           bodyLen,
-		Offset:               bodyOffset,
+		Offset:               start,
 		HasMore:              end < bodyLen,
 		Labels:               msg.Labels,
 		Attachments:          msg.Attachments,
