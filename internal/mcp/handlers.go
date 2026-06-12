@@ -32,6 +32,10 @@ const (
 	// searchContextChars is the max byte length of each context_snippets entry in search_messages.
 	searchContextChars = 300
 	defaultBodyChars   = 2000
+	// maxBodyChars caps the body slice returned by get_message regardless of what
+	// the caller requests via max_chars. Prevents a single tool call from flooding
+	// the context window; callers page forward using offset.
+	maxBodyChars = 4000
 )
 
 type paginatedResponse[T any] struct {
@@ -739,8 +743,8 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
 
-	maxChars := limitArg(args, "max_chars", defaultBodyChars)
-	if maxChars <= 0 {
+	maxChars := intArg(args, "max_chars", defaultBodyChars)
+	if maxChars <= 0 || maxChars > maxBodyChars {
 		maxChars = defaultBodyChars
 	}
 
