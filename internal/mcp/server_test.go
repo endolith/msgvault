@@ -416,6 +416,48 @@ func TestSearchMessages_HybridPoolSaturatedAlwaysEmitted(t *testing.T) {
 	assertpkg.Equal(t, "false", string(val), "pool_saturated")
 }
 
+// TestSearchMessages_HybridContextSnippets verifies that mode=hybrid returns
+// context_snippets extracted from message bodies, the same as FTS mode.
+func TestSearchMessages_HybridContextSnippets(t *testing.T) {
+	const msgID = int64(77)
+	body := strings.Repeat("a", 200) + " resistor 5.1k ohms " + strings.Repeat("z", 200)
+	backend := &fakeBackend{
+		active: vector.Generation{
+			ID: 1, Model: "fake", Dimension: 4,
+			Fingerprint: "fake:4", State: vector.GenerationActive,
+		},
+		searchHits: []vector.Hit{{MessageID: msgID, Score: 0.9}},
+	}
+	engine := hybrid.NewEngine(backend, nil, realEmbedder{dim: 4}, hybrid.Config{
+		ExpectedFingerprint: "fake:4", RRFK: 60, KPerSignal: 10,
+	})
+	mockEng := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{
+			msgID: testutil.NewMessageDetail(msgID).WithBodyText(body).BuildPtr(),
+		},
+	}
+	h := &handlers{
+		engine:       mockEng,
+		hybridEngine: engine,
+		backend:      backend,
+	}
+
+	type hybridRow struct {
+		ID              int64    `json:"id"`
+		ContextSnippets []string `json:"context_snippets"`
+	}
+	type hybridResp struct {
+		Messages []hybridRow `json:"messages"`
+	}
+	resp := runTool[hybridResp](t, "search_messages", h.searchMessages, map[string]any{
+		"query": "resistor 5.1k",
+		"mode":  "hybrid",
+	})
+	requirepkg.Len(t, resp.Messages, 1, "messages")
+	requirepkg.NotEmpty(t, resp.Messages[0].ContextSnippets, "context_snippets present")
+	assertpkg.Contains(t, resp.Messages[0].ContextSnippets[0], "5.1k")
+}
+
 func TestSearchMessages_HybridModePaginationUnsupported(t *testing.T) {
 	// offset>0 must be rejected before any hybrid-engine lookup. The
 	// pagination check runs first, so a missing hybridEngine does not
@@ -489,6 +531,43 @@ func TestGetMessage(t *testing.T) {
 		assertpkg.Equal(t, 2000, msg.Offset, "offset")
 		assertpkg.Len(t, msg.BodyText, 1000, "second page length")
 		assertpkg.False(t, msg.HasMore, "has_more")
+	})
+
+	t.Run("center_at mid-body", func(t *testing.T) {
+		body := strings.Repeat("a", 1000) + "KEYWORD" + strings.Repeat("z", 1000)
+		matchOffset := 1000
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				52: testutil.NewMessageDetail(52).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{
+			"id":        float64(52),
+			"center_at": float64(matchOffset),
+			"max_chars": float64(200),
+		})
+		// The window should be centered on the match: KEYWORD must appear inside it.
+		assertpkg.Contains(t, msg.BodyText, "KEYWORD")
+		assertpkg.LessOrEqual(t, msg.Offset, matchOffset, "window starts before match")
+		assertpkg.LessOrEqual(t, len(msg.BodyText), 200, "respects max_chars")
+	})
+
+	t.Run("center_at near start", func(t *testing.T) {
+		body := "KEYWORD" + strings.Repeat("z", 1000)
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				53: testutil.NewMessageDetail(53).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{
+			"id":        float64(53),
+			"center_at": float64(0),
+			"max_chars": float64(200),
+		})
+		assertpkg.Contains(t, msg.BodyText, "KEYWORD")
+		assertpkg.Equal(t, 0, msg.Offset, "starts at body start")
 	})
 
 	errorCases := []struct {

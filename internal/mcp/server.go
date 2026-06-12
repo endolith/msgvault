@@ -188,7 +188,9 @@ func ServeHTTPWithOptions(ctx context.Context, opts ServeOptions, addr string) e
 func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 	if !vectorAvailable {
 		return mcp.NewTool(ToolSearchMessages,
-			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. (This server is not configured for vector search; only keyword FTS is available.)"),
+			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
+				"Returns context_snippets: body excerpts centered on the query terms (up to 5 per message). "+
+				"(This server is not configured for vector search; only keyword FTS is available.)"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("query",
 				mcp.Required(),
@@ -200,7 +202,9 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 		)
 	}
 	return mcp.NewTool(ToolSearchMessages,
-		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
+		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
+			"All modes return context_snippets: body excerpts centered on the query terms (up to 5 per message). "+
+			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -225,14 +229,20 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 
 func getMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessage,
-		mcp.WithDescription("Get message details including recipients, labels, attachments, and a paginated slice of body text (HTML omitted). Use offset to read later portions of long bodies."),
+		mcp.WithDescription("Get message details including recipients, labels, attachments, and a slice of body text (HTML omitted). "+
+			"Two modes: sequential paging with offset (start reading from a byte position) or focused reading with center_at (center the window on a byte offset, e.g. a match_offset from search_in_message). "+
+			"body_length and offset in the response let you page forward with offset=<end of last chunk>. "+
+			"Note: snippet is pre-stored source metadata (may be empty for non-Gmail sources); use search_in_message for body search excerpts."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),
 			mcp.Description("Message ID"),
 		),
 		mcp.WithNumber("offset",
-			mcp.Description("Character offset into body_text to start reading (default 0)"),
+			mcp.Description("Start reading body_text from this byte offset (default 0). Ignored when center_at is provided."),
+		),
+		mcp.WithNumber("center_at",
+			mcp.Description("Center the body_text window on this byte offset (e.g. match_offset from search_in_message). Takes precedence over offset."),
 		),
 		mcp.WithNumber("max_chars",
 			mcp.Description("Maximum body_text characters to return (default 2000)"),
@@ -266,7 +276,8 @@ func exportAttachmentTool() mcp.Tool {
 
 func searchInMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolSearchInMessage,
-		mcp.WithDescription("Search for a term within one message body. Returns match positions with line numbers and snippets, paginated."),
+		mcp.WithDescription("Find all occurrences of a term within one message body. Returns each match with a character-centered snippet, line number, and match_offset. "+
+			"Use match_offset with get_message center_at to read a larger window around any match."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),
