@@ -27,8 +27,7 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
-	ToolSearchInMessage     = "search_in_message"
-	ToolGetMessageAround    = "get_message_around"
+	ToolSearchInMessage = "search_in_message"
 )
 
 // Common argument helpers for recurring tool option definitions.
@@ -110,7 +109,6 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
 	s.AddTool(searchInMessageTool(), h.searchInMessage)
-	s.AddTool(getMessageAroundTool(), h.getMessageAround)
 	s.AddTool(exportAttachmentTool(), h.exportAttachment)
 	s.AddTool(listMessagesTool(), h.listMessages)
 	s.AddTool(getStatsTool(), h.getStats)
@@ -282,24 +280,6 @@ func searchInMessageTool() mcp.Tool {
 			mcp.Description("Maximum matches to return (default 10)"),
 		),
 		withOffset(),
-	)
-}
-
-func getMessageAroundTool() mcp.Tool {
-	return mcp.NewTool(ToolGetMessageAround,
-		mcp.WithDescription("Find a phrase in a message body and return generous context around the match. If not found, returns an error and the first 500 characters of the body."),
-		mcp.WithReadOnlyHintAnnotation(true),
-		mcp.WithNumber("id",
-			mcp.Required(),
-			mcp.Description("Message ID"),
-		),
-		mcp.WithString("phrase",
-			mcp.Required(),
-			mcp.Description("Phrase to locate in the message body"),
-		),
-		mcp.WithNumber("context_chars",
-			mcp.Description("Total characters of context around the match (default 3000)"),
-		),
 	)
 }
 

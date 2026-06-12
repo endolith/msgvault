@@ -1186,25 +1186,6 @@ func TestSearchInMessage(t *testing.T) {
 	assertpkg.Equal(t, 2, resp.Data[0].Line, "line")
 }
 
-func TestGetMessageAround(t *testing.T) {
-	body := strings.Repeat("a", 100) + "5.1k ohm resistor" + strings.Repeat("z", 100)
-	eng := &querytest.MockEngine{
-		Messages: map[int64]*query.MessageDetail{
-			20: testutil.NewMessageDetail(20).WithBodyText(body).BuildPtr(),
-		},
-	}
-	h := newTestHandlers(eng)
-
-	resp := runTool[struct {
-		Phrase   string `json:"phrase"`
-		BodyText string `json:"body_text"`
-	}](t, "get_message_around", h.getMessageAround, map[string]any{
-		"id":     float64(20),
-		"phrase": "5.1k ohm",
-	})
-	assertpkg.Contains(t, resp.BodyText, "5.1k ohm", "context includes phrase")
-}
-
 func TestListMessagesConversationID(t *testing.T) {
 	var captured query.MessageFilter
 	eng := &querytest.MockEngine{
