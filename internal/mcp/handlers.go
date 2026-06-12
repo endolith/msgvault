@@ -801,31 +801,24 @@ func findTermMatches(body, term string) []inMessageMatch {
 	if body == "" || term == "" {
 		return nil
 	}
+	lowerBody := strings.ToLower(body)
 	lowerTerm := strings.ToLower(term)
-	lines := strings.Split(body, "\n")
+	termLen := len(term)
 	var matches []inMessageMatch
-	byteOffset := 0
-	for lineNum, line := range lines {
-		lowerLine := strings.ToLower(line)
-		searchFrom := 0
-		for {
-			idx := strings.Index(lowerLine[searchFrom:], lowerTerm)
-			if idx < 0 {
-				break
-			}
-			pos := searchFrom + idx
-			snippet := line
-			if len(snippet) > 300 {
-				snippet = snippet[:300] + "..."
-			}
-			matches = append(matches, inMessageMatch{
-				CharOffset: byteOffset + pos,
-				Snippet:    snippet,
-				Line:       lineNum + 1,
-			})
-			searchFrom = pos + len(term)
+	searchFrom := 0
+	for {
+		idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+		if idx < 0 {
+			break
 		}
-		byteOffset += len(line) + 1
+		pos := searchFrom + idx
+		searchFrom = pos + 1
+		start, end := contextWindow(len(body), pos, termLen, searchContextChars)
+		matches = append(matches, inMessageMatch{
+			CharOffset: pos,
+			Snippet:    body[start:end],
+			Line:       lineNumberAt(body, pos),
+		})
 	}
 	return matches
 }

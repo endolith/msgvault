@@ -27,7 +27,7 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
-	ToolSearchInMessage = "search_in_message"
+	ToolSearchInMessage     = "search_in_message"
 )
 
 // Common argument helpers for recurring tool option definitions.
