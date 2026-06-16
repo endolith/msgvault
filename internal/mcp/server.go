@@ -233,9 +233,10 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 func getMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessage,
 		mcp.WithDescription("Get message details including recipients, labels, attachments, and a slice of body text (HTML omitted). "+
-			"Two modes: sequential paging with offset (byte offset into body_text) or focused reading with center_at (byte offset to center the window on, e.g. char_offset from search_in_message). "+
-			"body_length and offset in the response let you page forward with offset=<end of last chunk>. "+
-			"Note: snippet is pre-stored source metadata (may be empty for non-Gmail sources); use search_in_message for body search excerpts."),
+			"Body paging mirrors search pagination: body_length=total bytes, offset=where this chunk starts, body_returned=bytes in this chunk, has_more=more body follows. "+
+			"To read sequentially: call again with offset += body_returned. "+
+			"To jump to a match: use center_at=<char_offset from search_in_message> to center the window on that location. "+
+			"Note: snippet is pre-stored source metadata (may be empty for non-Gmail sources)."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),

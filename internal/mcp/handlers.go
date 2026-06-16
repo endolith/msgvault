@@ -792,7 +792,8 @@ type getMessageResponse struct {
 	Bcc                  []query.Address        `json:"bcc"`
 	BodyText             string                 `json:"body_text"`
 	BodyHTML             string                 `json:"body_html"`
-	BodyLength           int                    `json:"body_length"`
+	BodyLength           int                    `json:"body_length"`   // total bytes in the full body (like total in search)
+	BodyReturned         int                    `json:"body_returned"` // bytes in this body_text chunk (like returned in search)
 	Offset               int                    `json:"offset"`
 	HasMore              bool                   `json:"has_more"`
 	Labels               []string               `json:"labels"`
@@ -850,6 +851,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		BodyText:             bodyByteSlice(fullBody, start, end),
 		BodyHTML:             "",
 		BodyLength:           bodyLen,
+		BodyReturned:         end - start,
 		Offset:               start,
 		HasMore:              end < bodyLen,
 		Labels:               msg.Labels,

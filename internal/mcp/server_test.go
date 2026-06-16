@@ -71,6 +71,7 @@ type getMessageResp struct {
 	BodyText       string `json:"body_text"`
 	BodyHTML       string `json:"body_html"`
 	BodyLength     int    `json:"body_length"`
+	BodyReturned   int    `json:"body_returned"`
 	Offset         int    `json:"offset"`
 	HasMore        bool   `json:"has_more"`
 	ConversationID int64  `json:"conversation_id"`
@@ -571,6 +572,7 @@ func TestGetMessage(t *testing.T) {
 		assert.Equal("Hello world", msg.BodyText, "body_text")
 		assert.Empty(msg.BodyHTML, "body_html stripped")
 		assert.Equal(11, msg.BodyLength, "body_length")
+		assert.Equal(11, msg.BodyReturned, "body_returned")
 		assert.False(msg.HasMore, "has_more")
 	})
 
@@ -584,6 +586,7 @@ func TestGetMessage(t *testing.T) {
 		h2 := newTestHandlers(eng2)
 		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{"id": float64(50)})
 		assertpkg.Equal(t, 5000, msg.BodyLength, "body_length")
+		assertpkg.Equal(t, 2000, msg.BodyReturned, "body_returned")
 		assertpkg.Len(t, msg.BodyText, 2000, "truncated body_text")
 		assertpkg.True(t, msg.HasMore, "has_more")
 	})
@@ -601,6 +604,7 @@ func TestGetMessage(t *testing.T) {
 			"offset": float64(2000),
 		})
 		assertpkg.Equal(t, 2000, msg.Offset, "offset")
+		assertpkg.Equal(t, 1000, msg.BodyReturned, "body_returned")
 		assertpkg.Len(t, msg.BodyText, 1000, "second page length")
 		assertpkg.False(t, msg.HasMore, "has_more")
 	})
