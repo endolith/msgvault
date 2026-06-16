@@ -86,6 +86,22 @@ func newPaginatedResponseHasMore[T any](data []T, offset int, hasMore bool) pagi
 	}
 }
 
+// newPaginatedResponseNoTotal builds a page when the backend never reports a
+// total match count (body FTS). total is always totalCountUnknown; use has_more
+// to page.
+func newPaginatedResponseNoTotal[T any](data []T, offset int, hasMore bool) paginatedResponse[T] {
+	if data == nil {
+		data = []T{}
+	}
+	return paginatedResponse[T]{
+		Data:     data,
+		Total:    totalCountUnknown,
+		Returned: len(data),
+		Offset:   offset,
+		HasMore:  hasMore,
+	}
+}
+
 func searchLimitArg(args map[string]any) int {
 	limit := limitArg(args, "limit", defaultSearchLimit)
 	if limit > maxSearchMessagesLimit {
@@ -312,9 +328,14 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("search_message_bodies requires at least one free-text term; use search_messages for filter-only queries"), nil
 	}
 
-	results, err := h.engine.Search(ctx, q, limit, offset)
+	results, err := h.engine.Search(ctx, q, limit+1, offset)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	hasMore := len(results) > limit
+	if hasMore {
+		results = results[:limit]
 	}
 
 	data := make([]searchMessageItem, 0, len(results))
@@ -332,7 +353,7 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		data = append(data, item)
 	}
 
-	return jsonResult(newPaginatedResponseHasMore(data, offset))
+	return jsonResult(newPaginatedResponseNoTotal(data, offset, hasMore))
 }
 
 // bodyByteSlice returns body[start:end], nudging boundaries inward so the

@@ -612,6 +612,7 @@ func TestGetMessage(t *testing.T) {
 	})
 
 	t.Run("truncates long body", func(t *testing.T) {
+		assert := assertpkg.New(t)
 		longBody := strings.Repeat("x", 5000)
 		eng2 := &querytest.MockEngine{
 			Messages: map[int64]*query.MessageDetail{
@@ -620,13 +621,14 @@ func TestGetMessage(t *testing.T) {
 		}
 		h2 := newTestHandlers(eng2)
 		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{"id": float64(50)})
-		assertpkg.Equal(t, 5000, msg.BodyLength, "body_length")
-		assertpkg.Equal(t, 2000, msg.BodyReturned, "body_returned")
-		assertpkg.Len(t, msg.BodyText, 2000, "truncated body_text")
-		assertpkg.True(t, msg.HasMore, "has_more")
+		assert.Equal(5000, msg.BodyLength, "body_length")
+		assert.Equal(2000, msg.BodyReturned, "body_returned")
+		assert.Len(msg.BodyText, 2000, "truncated body_text")
+		assert.True(msg.HasMore, "has_more")
 	})
 
 	t.Run("offset pagination", func(t *testing.T) {
+		assert := assertpkg.New(t)
 		body := strings.Repeat("a", 3000)
 		eng2 := &querytest.MockEngine{
 			Messages: map[int64]*query.MessageDetail{
@@ -638,10 +640,10 @@ func TestGetMessage(t *testing.T) {
 			"id":     float64(51),
 			"offset": float64(2000),
 		})
-		assertpkg.Equal(t, 2000, msg.Offset, "offset")
-		assertpkg.Equal(t, 1000, msg.BodyReturned, "body_returned")
-		assertpkg.Len(t, msg.BodyText, 1000, "second page length")
-		assertpkg.False(t, msg.HasMore, "has_more")
+		assert.Equal(2000, msg.Offset, "offset")
+		assert.Equal(1000, msg.BodyReturned, "body_returned")
+		assert.Len(msg.BodyText, 1000, "second page length")
+		assert.False(msg.HasMore, "has_more")
 	})
 
 	t.Run("center_at mid-body", func(t *testing.T) {
