@@ -40,12 +40,11 @@ const (
 )
 
 type paginatedResponse[T any] struct {
-	Data         []T   `json:"data"`
-	Total        int64 `json:"total"`
-	TotalMatched int64 `json:"total_matched,omitempty"`
-	Returned     int   `json:"returned"`
-	Offset       int   `json:"offset"`
-	HasMore      bool  `json:"has_more"`
+	Data     []T   `json:"data"`
+	Total    int64 `json:"total"`
+	Returned int   `json:"returned"`
+	Offset   int   `json:"offset"`
+	HasMore  bool  `json:"has_more"`
 }
 
 func newPaginatedResponse[T any](data []T, total int64, offset int) paginatedResponse[T] {
@@ -54,12 +53,11 @@ func newPaginatedResponse[T any](data []T, total int64, offset int) paginatedRes
 	}
 	returned := len(data)
 	return paginatedResponse[T]{
-		Data:         data,
-		Total:        total,
-		TotalMatched: total,
-		Returned:     returned,
-		Offset:       offset,
-		HasMore:      int64(offset+returned) < total,
+		Data:     data,
+		Total:    total,
+		Returned: returned,
+		Offset:   offset,
+		HasMore:  int64(offset+returned) < total,
 	}
 }
 
@@ -261,8 +259,8 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	type searchMessageItem struct {
 		query.MessageSummary
 
-		ContextSnippets   []string `json:"context_snippets,omitempty"`
-		SnippetsTruncated bool     `json:"snippets_truncated,omitempty"`
+		ContextSnippets          []string `json:"context_snippets,omitempty"`
+		ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
 	}
 
 	data := make([]searchMessageItem, 0, len(results))
@@ -273,7 +271,7 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 			if err == nil && msg != nil {
 				snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
 				if len(snippets) > maxContextSnippets {
-					item.SnippetsTruncated = true
+					item.ContextSnippetsTruncated = true
 					snippets = snippets[:maxContextSnippets]
 				}
 				item.ContextSnippets = snippets
@@ -418,9 +416,9 @@ type hybridScoreBreakdown struct {
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score             *hybridScoreBreakdown `json:"score,omitempty"`
-	ContextSnippets   []string              `json:"context_snippets,omitempty"`
-	SnippetsTruncated bool                  `json:"snippets_truncated,omitempty"`
+	Score                    *hybridScoreBreakdown `json:"score,omitempty"`
+	ContextSnippets          []string              `json:"context_snippets,omitempty"`
+	ContextSnippetsTruncated bool                  `json:"context_snippets_truncated,omitempty"`
 }
 
 // hybridGenerationSummary describes the active vector-index generation
@@ -570,7 +568,7 @@ func (h *handlers) searchMessagesHybrid(
 		}
 		snippets := extractContextChar(detail.BodyText, parsed.TextTerms, searchContextChars)
 		if len(snippets) > maxContextSnippets {
-			items[i].SnippetsTruncated = true
+			items[i].ContextSnippetsTruncated = true
 			snippets = snippets[:maxContextSnippets]
 		}
 		items[i].ContextSnippets = snippets
@@ -783,7 +781,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	var start, end int
 	if centerAt := intArg(args, "center_at", -1); centerAt >= 0 {
-		// Center the window on the given byte offset (e.g. a match_offset from
+		// Center the window on the given byte offset (e.g. char_offset from
 		// search_in_message). contextWindow handles clamping to body boundaries.
 		start, end = contextWindow(bodyLen, centerAt, 0, maxChars)
 	} else {

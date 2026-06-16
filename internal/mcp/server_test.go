@@ -51,19 +51,18 @@ type attachmentMeta struct {
 }
 
 type paginatedSearchMessages struct {
-	Data         []searchMessageRow `json:"data"`
-	Total        int64              `json:"total"`
-	TotalMatched int64              `json:"total_matched"`
-	Returned     int                `json:"returned"`
-	Offset       int                `json:"offset"`
-	HasMore      bool               `json:"has_more"`
+	Data     []searchMessageRow `json:"data"`
+	Total    int64              `json:"total"`
+	Returned int                `json:"returned"`
+	Offset   int                `json:"offset"`
+	HasMore  bool               `json:"has_more"`
 }
 
 type searchMessageRow struct {
 	query.MessageSummary
 
-	ContextSnippets   []string `json:"context_snippets"`
-	SnippetsTruncated bool     `json:"snippets_truncated"`
+	ContextSnippets          []string `json:"context_snippets"`
+	ContextSnippetsTruncated bool     `json:"context_snippets_truncated"`
 }
 
 type getMessageResp struct {
@@ -146,7 +145,7 @@ func TestSearchMessages(t *testing.T) {
 		assert.Equal("Hello", resp.Data[0].Subject, "subject")
 		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
-		assert.Equal(int64(1), resp.TotalMatched, "total_matched")
+		assert.Equal(int64(1), resp.Total, "total")
 	})
 
 	t.Run("missing query", func(t *testing.T) {

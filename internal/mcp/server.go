@@ -189,7 +189,8 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 	if !vectorAvailable {
 		return mcp.NewTool(ToolSearchMessages,
 			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-				"Returns context_snippets: body excerpts centered on the query terms (up to 5 per message, 300 bytes each). "+
+				"Each hit includes snippet (pre-stored source preview, often empty or just the message start) and context_snippets (body excerpts centered on your query terms, up to 5 per message, 300 bytes each). "+
+				"Response pagination: total=match count, offset=skip N hits, has_more=more pages exist. "+
 				"(This server is not configured for vector search; only keyword FTS is available.)"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("query",
@@ -203,7 +204,8 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 	}
 	return mcp.NewTool(ToolSearchMessages,
 		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-			"All modes return context_snippets: body excerpts centered on the query terms (up to 5 per message, 300 bytes each). "+
+			"Each hit includes snippet (pre-stored source preview) and context_snippets (body excerpts centered on query terms, up to 5 per message, 300 bytes each). "+
+			"FTS mode pagination: total, offset, has_more. Vector/hybrid return a single page (no offset); bump limit instead. "+
 			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
@@ -230,7 +232,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 func getMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessage,
 		mcp.WithDescription("Get message details including recipients, labels, attachments, and a slice of body text (HTML omitted). "+
-			"Two modes: sequential paging with offset (start reading from a byte position) or focused reading with center_at (center the window on a byte offset, e.g. a match_offset from search_in_message). "+
+			"Two modes: sequential paging with offset (byte offset into body_text) or focused reading with center_at (byte offset to center the window on, e.g. char_offset from search_in_message). "+
 			"body_length and offset in the response let you page forward with offset=<end of last chunk>. "+
 			"Note: snippet is pre-stored source metadata (may be empty for non-Gmail sources); use search_in_message for body search excerpts."),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -242,7 +244,7 @@ func getMessageTool() mcp.Tool {
 			mcp.Description("Byte offset from the start of body_text to begin reading (default 0). Ignored when center_at is provided."),
 		),
 		mcp.WithNumber("center_at",
-			mcp.Description("Byte offset from the start of body_text to center the window on (e.g. match_offset from search_in_message). Takes precedence over offset."),
+			mcp.Description("Byte offset from the start of body_text to center the window on (e.g. char_offset from search_in_message). Takes precedence over offset."),
 		),
 		mcp.WithNumber("max_chars",
 			mcp.Description("Maximum body_text bytes to return (default 2000, max 4000). Out-of-range values are silently replaced with the default."),
@@ -276,8 +278,8 @@ func exportAttachmentTool() mcp.Tool {
 
 func searchInMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolSearchInMessage,
-		mcp.WithDescription("Find all occurrences of a term within one message body. Returns each match with a character-centered snippet, line number, and match_offset. "+
-			"Use match_offset with get_message center_at to read a larger window around any match."),
+		mcp.WithDescription("Find all occurrences of a term within one message body. Returns each match with a character-centered snippet, line number, and char_offset (byte offset into body_text). "+
+			"Use char_offset with get_message center_at to read a larger window around any match."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithNumber("id",
 			mcp.Required(),
