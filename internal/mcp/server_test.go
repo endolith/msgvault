@@ -535,10 +535,12 @@ func TestSearchMessages_HybridModePagination(t *testing.T) {
 		"offset": float64(1),
 		"limit":  float64(1),
 	})
-	requirepkg.Len(t, resp.Data, 1, "data")
-	assertpkg.Equal(t, int64(20), resp.Data[0].ID, "second ranked hit")
-	assertpkg.Equal(t, 1, resp.Offset, "offset")
-	assertpkg.True(t, resp.HasMore, "has_more")
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	require.Len(resp.Data, 1, "data")
+	assert.Equal(int64(20), resp.Data[0].ID, "second ranked hit")
+	assert.Equal(1, resp.Offset, "offset")
+	assert.True(resp.HasMore, "has_more")
 }
 
 func TestSearchMessages_UnknownMode(t *testing.T) {
