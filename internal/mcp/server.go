@@ -189,7 +189,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 	if !vectorAvailable {
 		return mcp.NewTool(ToolSearchMessages,
 			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-				"Returns context_snippets: body excerpts centered on the query terms (up to 3 per message, 300 bytes each). "+
+				"Returns context_snippets: body excerpts centered on the query terms (up to 5 per message, 300 bytes each). "+
 				"(This server is not configured for vector search; only keyword FTS is available.)"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("query",
@@ -197,13 +197,13 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 				mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01')"),
 			),
 			withAccount(),
-			withLimit("10"),
+			withLimit("20"),
 			withOffset(),
 		)
 	}
 	return mcp.NewTool(ToolSearchMessages,
 		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-			"All modes return context_snippets: body excerpts centered on the query terms (up to 3 per message, 300 bytes each). "+
+			"All modes return context_snippets: body excerpts centered on the query terms (up to 5 per message, 300 bytes each). "+
 			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
@@ -211,7 +211,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 			mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01'); mode=vector|hybrid require at least one free-text term"),
 		),
 		withAccount(),
-		withLimit("10"),
+		withLimit("20"),
 		// offset is FTS-only here. Vector/hybrid responses don't page —
 		// callers should bump limit (capped by max_page_size_hybrid) instead.
 		mcp.WithNumber("offset",
