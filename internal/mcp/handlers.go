@@ -609,12 +609,10 @@ func (h *handlers) searchMessagesHybrid(
 		items[i].ContextSnippets = snippets
 	}
 
-	page := items
+	var page []hybridMessageItem
 	if offset < len(items) {
 		end := min(offset+limit, len(items))
 		page = items[offset:end]
-	} else {
-		page = nil
 	}
 	hasMore := offset+limit < len(items) ||
 		(meta.PoolSaturated && len(hits) >= fetchLimit)

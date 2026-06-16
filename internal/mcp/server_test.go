@@ -511,9 +511,9 @@ func TestSearchMessages_HybridModePagination(t *testing.T) {
 	})
 	mockEng := &querytest.MockEngine{
 		Messages: map[int64]*query.MessageDetail{
-			10:  testutil.NewMessageDetail(10).WithBodyText("first hit").BuildPtr(),
-			20:  testutil.NewMessageDetail(20).WithBodyText("second hit").BuildPtr(),
-			77:  testutil.NewMessageDetail(msgID).WithBodyText("third hit").BuildPtr(),
+			10: testutil.NewMessageDetail(10).WithBodyText("first hit").BuildPtr(),
+			20: testutil.NewMessageDetail(20).WithBodyText("second hit").BuildPtr(),
+			77: testutil.NewMessageDetail(msgID).WithBodyText("third hit").BuildPtr(),
 		},
 	}
 	h := &handlers{
@@ -524,10 +524,12 @@ func TestSearchMessages_HybridModePagination(t *testing.T) {
 	}
 
 	type hybridPage struct {
-		Data     []struct{ ID int64 `json:"id"` } `json:"data"`
-		Offset   int                              `json:"offset"`
-		Returned int                              `json:"returned"`
-		HasMore  bool                             `json:"has_more"`
+		Data []struct {
+			ID int64 `json:"id"`
+		} `json:"data"`
+		Offset   int  `json:"offset"`
+		Returned int  `json:"returned"`
+		HasMore  bool `json:"has_more"`
 	}
 	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
 		"query":  "hit",
