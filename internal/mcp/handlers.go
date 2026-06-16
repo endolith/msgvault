@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -33,6 +34,8 @@ const (
 	// the caller requests via max_chars. Prevents a single tool call from flooding
 	// the context window; callers page forward using offset.
 	maxBodyChars = 4000
+	// searchContextChars is the max byte length of each snippet in search_in_message.
+	searchContextChars = 300
 	// totalCountUnknown is returned when the backend cannot report a full match
 	// count (body FTS fallback, hybrid/vector ranking depth, or list_messages
 	// without a separate count query). Clients should use has_more for paging.
@@ -668,6 +671,78 @@ func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
 	return start, end
 }
 
+func lineNumberAt(body string, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 1
+	}
+	if byteOffset > len(body) {
+		byteOffset = len(body)
+	}
+	return 1 + strings.Count(body[:byteOffset], "\n")
+}
+
+// extractContextChar returns up to contextChars of body text centered on each
+// case-insensitive term match, merging overlapping windows.
+func extractContextChar(body string, terms []string, contextChars int) []string {
+	if body == "" || len(terms) == 0 || contextChars <= 0 {
+		return nil
+	}
+
+	lowerBody := strings.ToLower(body)
+
+	type span struct {
+		start, end int
+	}
+	var spans []span
+
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		lowerTerm := strings.ToLower(term)
+		termLen := len(term)
+		searchFrom := 0
+		for {
+			idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+			if idx < 0 {
+				break
+			}
+			pos := searchFrom + idx
+			searchFrom = pos + 1
+
+			start, end := contextWindow(len(body), pos, termLen, contextChars)
+			spans = append(spans, span{start: start, end: end})
+		}
+	}
+
+	if len(spans) == 0 {
+		return nil
+	}
+
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end < spans[j].end
+		}
+		return spans[i].start < spans[j].start
+	})
+
+	merged := []span{spans[0]}
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start <= last.end {
+			last.end = max(last.end, s.end)
+			continue
+		}
+		merged = append(merged, s)
+	}
+
+	out := make([]string, 0, len(merged))
+	for _, s := range merged {
+		out = append(out, bodyByteSlice(body, s.start, s.end))
+	}
+	return out
+}
+
 type getMessageResponse struct {
 	ID                   int64                  `json:"id"`
 	SourceMessageID      string                 `json:"source_message_id"`
@@ -752,6 +827,69 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		Labels:               msg.Labels,
 		Attachments:          msg.Attachments,
 	})
+}
+
+type inMessageMatch struct {
+	CharOffset int    `json:"char_offset"`
+	Snippet    string `json:"snippet"`
+	Line       int    `json:"line"`
+}
+
+func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	id, err := getIDArg(args, "id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	queryStr, _ := args["query"].(string)
+	queryStr = strings.TrimSpace(queryStr)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := limitArg(args, "limit", 10)
+	offset := limitArg(args, "offset", 0)
+
+	msg, err := h.engine.GetMessage(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+
+	allMatches := findTermMatches(msg.BodyText, queryStr)
+	total := int64(len(allMatches))
+	if offset >= len(allMatches) {
+		return jsonResult(newPaginatedResponse([]inMessageMatch{}, total, offset))
+	}
+	end := min(offset+limit, len(allMatches))
+	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
+}
+
+func findTermMatches(body, term string) []inMessageMatch {
+	if body == "" || term == "" {
+		return nil
+	}
+	lowerBody := strings.ToLower(body)
+	lowerTerm := strings.ToLower(term)
+	termLen := len(term)
+	var matches []inMessageMatch
+	searchFrom := 0
+	for {
+		idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+		if idx < 0 {
+			break
+		}
+		pos := searchFrom + idx
+		searchFrom = pos + 1
+		start, end := contextWindow(len(body), pos, termLen, searchContextChars)
+		matches = append(matches, inMessageMatch{
+			CharOffset: pos,
+			Snippet:    bodyByteSlice(body, start, end),
+			Line:       lineNumberAt(body, pos),
+		})
+	}
+	return matches
 }
 
 const maxAttachmentSize = 50 * 1024 * 1024 // 50MB

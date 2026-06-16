@@ -27,6 +27,7 @@ const (
 	ToolStageDeletion       = "stage_deletion"
 	ToolSearchByDomains     = "search_by_domains"
 	ToolFindSimilarMessages = "find_similar_messages"
+	ToolSearchInMessage     = "search_in_message"
 )
 
 // search_messages mode values (wire format).
@@ -114,6 +115,7 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	s.AddTool(searchMessagesTool(vectorAvailable), h.searchMessages)
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
+	s.AddTool(searchInMessageTool(), h.searchInMessage)
 	s.AddTool(exportAttachmentTool(), h.exportAttachment)
 	s.AddTool(listMessagesTool(), h.listMessages)
 	s.AddTool(getStatsTool(), h.getStats)
@@ -277,6 +279,26 @@ func exportAttachmentTool() mcp.Tool {
 		mcp.WithString("destination",
 			mcp.Description("Directory to save the file to (default: ~/Downloads)"),
 		),
+	)
+}
+
+func searchInMessageTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchInMessage,
+		mcp.WithDescription("Find all occurrences of a term within one message body. Returns each match with a character-centered snippet, line number, and char_offset (byte offset into body_text). "+
+			"Use char_offset with get_message center_at to read a larger window around any match."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithNumber("id",
+			mcp.Required(),
+			mcp.Description("Message ID"),
+		),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Term to find in the message body"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum matches to return (default 10)"),
+		),
+		withOffset(),
 	)
 }
 

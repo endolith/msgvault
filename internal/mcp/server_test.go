@@ -78,6 +78,14 @@ type getMessageResp struct {
 	ConversationID int64  `json:"conversation_id"`
 }
 
+type paginatedInMessageMatches struct {
+	Data     []inMessageMatch `json:"data"`
+	Total    int64            `json:"total"`
+	Returned int              `json:"returned"`
+	Offset   int              `json:"offset"`
+	HasMore  bool             `json:"has_more"`
+}
+
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng *querytest.MockEngine) *handlers {
 	return &handlers{engine: eng}
@@ -610,6 +618,74 @@ func TestBodyByteSlice(t *testing.T) {
 	})
 }
 
+func TestExtractContextChar(t *testing.T) {
+	t.Run("short body", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		body := "The resistor value should be 5.1k ohms not 10k as previously stated."
+		snippets := extractContextChar(body, []string{"5.1k"}, 200)
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.LessOrEqual(len(snippets[0]), 200)
+	})
+
+	t.Run("long quoted line", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		quoted := strings.Repeat("> This is quoted history that should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		snippets := extractContextChar(body, []string{"5.1k"}, 300)
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.Len(snippets[0], 300)
+		assert.NotContains(snippets[0], strings.Repeat("> This", 10))
+	})
+
+	t.Run("overlapping matches merge", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		body := "foo bar foo baz"
+		snippets := extractContextChar(body, []string{"foo"}, 20)
+		require.Len(snippets, 1)
+		assert.Equal(body, snippets[0])
+	})
+
+	t.Run("match near start", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		body := "needle" + strings.Repeat("x", 500)
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[:100], snippets[0])
+	})
+
+	t.Run("match near end", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		body := strings.Repeat("a", 500) + "needle"
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[len(body)-100:], snippets[0])
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("hello world", []string{"zzz"}, 300))
+	})
+
+	t.Run("empty body", func(t *testing.T) {
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("", []string{"foo"}, 300))
+	})
+
+	t.Run("short term skipped", func(t *testing.T) {
+		assert := assertpkg.New(t)
+		assert.Nil(extractContextChar("abc", []string{"a"}, 300))
+	})
+}
+
 func TestSearchMessages_UnknownMode(t *testing.T) {
 	h := newTestHandlers(&querytest.MockEngine{})
 
@@ -900,6 +976,48 @@ func TestAggregateInvalidDates(t *testing.T) {
 			runToolExpectError(t, "aggregate", h.aggregate, tt.args)
 		})
 	}
+}
+
+func TestSearchInMessage(t *testing.T) {
+	t.Run("reports line and centered snippet", func(t *testing.T) {
+		body := "line one\nline two has the resistor value should be 5.1k ohms\nline three"
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				10: testutil.NewMessageDetail(10).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(10),
+			"query": "resistor",
+		})
+		requirepkg.Len(t, resp.Data, 1, "matches")
+		assertpkg.Equal(t, 2, resp.Data[0].Line, "line")
+		assertpkg.Contains(t, resp.Data[0].Snippet, "resistor")
+	})
+
+	t.Run("long quoted line", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		quoted := strings.Repeat("> quoted history should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				11: testutil.NewMessageDetail(11).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(11),
+			"query": "5.1k",
+		})
+		require.Len(resp.Data, 1, "matches")
+		assert.Contains(resp.Data[0].Snippet, "5.1k")
+		assert.LessOrEqual(len(resp.Data[0].Snippet), searchContextChars)
+		assert.NotContains(resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
+	})
 }
 
 // createAttachmentFixture creates a content-addressed file under dir using the given hash.
