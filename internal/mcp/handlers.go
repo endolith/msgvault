@@ -29,13 +29,14 @@ const (
 	maxLimit               = 1000
 	maxSearchMessagesLimit = 50
 	defaultSearchLimit     = 20
-	defaultBodyChars       = 2000
+	maxContextSnippets     = 5
+	// searchContextChars is the max byte length of each context_snippets entry in search_messages.
+	searchContextChars = 300
+	defaultBodyChars   = 2000
 	// maxBodyChars caps the body slice returned by get_message regardless of what
 	// the caller requests via max_chars. Prevents a single tool call from flooding
 	// the context window; callers page forward using offset.
 	maxBodyChars = 4000
-	// searchContextChars is the max byte length of each snippet in search_in_message.
-	searchContextChars = 300
 	// totalCountUnknown is returned when the backend cannot report a full match
 	// count (body FTS fallback, hybrid/vector ranking depth, or list_messages
 	// without a separate count query). Clients should use has_more for paging.
@@ -217,6 +218,18 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 	return data, nil
 }
 
+// searchMessageItem carries a message summary plus body excerpts centered on
+// query terms. Used by searchMessageBodies and searchMessagesHybrid.
+type searchMessageItem struct {
+	query.MessageSummary
+
+	ContextSnippets          []string `json:"context_snippets,omitempty"`
+	ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
+}
+
+// searchMessages searches message metadata only (subject, sender, recipients,
+// labels, dates). Use search_message_bodies for full-body keyword search.
+// Vector and hybrid modes are delegated to searchMessagesHybrid.
 func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
@@ -226,25 +239,21 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	mode, _ := args["mode"].(string)
-	if mode == "" {
-		mode = searchModeFTS
-	}
 	explain, _ := args["explain"].(bool)
 
 	if mode == searchModeVector || mode == searchModeHybrid {
 		return h.searchMessagesHybrid(ctx, args, queryStr, mode, explain)
 	}
 
-	if mode != searchModeFTS {
+	if mode != "" {
 		return mcp.NewToolResultError(
-			fmt.Sprintf("invalid mode %q: must be %s, %s, or %s", mode, searchModeFTS, searchModeVector, searchModeHybrid),
+			fmt.Sprintf("invalid mode %q: must be %s or %s (or omit for metadata search)", mode, searchModeVector, searchModeHybrid),
 		), nil
 	}
 
 	limit := searchLimitArg(args)
 	offset := limitArg(args, "offset", 0)
 
-	// Look up account filter
 	account, _ := args["account"].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
@@ -258,23 +267,9 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 
 	filter := query.MessageFilter{SourceID: sourceID}
 
-	// Try fast search first (metadata only), fall back to full FTS.
 	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-	}
-
-	// If fast search returns nothing and query has free text, try full FTS.
-	if len(results) == 0 && len(q.TextTerms) > 0 {
-		results, err = h.engine.Search(ctx, q, limit+1, offset)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-		}
-		hasMore := len(results) > limit
-		if hasMore {
-			results = results[:limit]
-		}
-		return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
 	}
 
 	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
@@ -283,6 +278,179 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	return jsonResult(newPaginatedResponse(results, totalMatched, offset))
+}
+
+// searchMessageBodies performs full-text search over message bodies and returns
+// context_snippets — short excerpts centered on each matched term. Requires at
+// least one free-text term; use search_messages for filter-only queries.
+func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	queryStr, _ := args["query"].(string)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := searchLimitArg(args)
+	offset := limitArg(args, "offset", 0)
+
+	account, _ := args["account"].(string)
+	sourceID, err := h.getAccountID(ctx, account)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	q := search.Parse(queryStr)
+	if sourceID != nil {
+		q.AccountIDs = []int64{*sourceID}
+	}
+
+	if len(q.TextTerms) == 0 {
+		return mcp.NewToolResultError("search_message_bodies requires at least one free-text term; use search_messages for filter-only queries"), nil
+	}
+
+	results, err := h.engine.Search(ctx, q, limit+1, offset)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	hasMore := len(results) > limit
+	if hasMore {
+		results = results[:limit]
+	}
+
+	data := make([]searchMessageItem, 0, len(results))
+	for _, r := range results {
+		item := searchMessageItem{MessageSummary: r}
+		msg, err := h.engine.GetMessage(ctx, r.ID)
+		if err == nil && msg != nil {
+			snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
+			if len(snippets) > maxContextSnippets {
+				item.ContextSnippetsTruncated = true
+				snippets = snippets[:maxContextSnippets]
+			}
+			item.ContextSnippets = snippets
+		}
+		data = append(data, item)
+	}
+
+	return jsonResult(newPaginatedResponseNoTotal(data, offset, hasMore))
+}
+
+// bodyByteSlice returns body[start:end], nudging boundaries inward so the
+// result is always valid UTF-8. MCP body APIs use byte offsets; without
+// this, a window can split a multibyte rune (emoji, CJK, accented letters).
+func bodyByteSlice(body string, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(body) {
+		end = len(body)
+	}
+	if start >= end {
+		return ""
+	}
+	for start < end && !utf8.RuneStart(body[start]) {
+		start++
+	}
+	for end > start && end < len(body) && !utf8.RuneStart(body[end]) {
+		end--
+	}
+	for end > start {
+		s := body[start:end]
+		if utf8.ValidString(s) {
+			return s
+		}
+		end--
+	}
+	return ""
+}
+
+// contextWindow returns byte offsets [start, end) for a window of up to
+// contextChars bytes centered on a match at pos with byte length termLen.
+func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
+	start = pos - (contextChars-termLen)/2
+	end = start + contextChars
+	if start < 0 {
+		start = 0
+		end = min(bodyLen, contextChars)
+	} else if end > bodyLen {
+		end = bodyLen
+		start = max(0, end-contextChars)
+	}
+	return start, end
+}
+
+func lineNumberAt(body string, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 1
+	}
+	if byteOffset > len(body) {
+		byteOffset = len(body)
+	}
+	return 1 + strings.Count(body[:byteOffset], "\n")
+}
+
+// extractContextChar returns up to contextChars of body text centered on each
+// case-insensitive term match, merging overlapping windows.
+func extractContextChar(body string, terms []string, contextChars int) []string {
+	if body == "" || len(terms) == 0 || contextChars <= 0 {
+		return nil
+	}
+
+	lowerBody := strings.ToLower(body)
+
+	type span struct {
+		start, end int
+	}
+	var spans []span
+
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		lowerTerm := strings.ToLower(term)
+		termLen := len(term)
+		searchFrom := 0
+		for {
+			idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+			if idx < 0 {
+				break
+			}
+			pos := searchFrom + idx
+			searchFrom = pos + 1
+
+			start, end := contextWindow(len(body), pos, termLen, contextChars)
+			spans = append(spans, span{start: start, end: end})
+		}
+	}
+
+	if len(spans) == 0 {
+		return nil
+	}
+
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end < spans[j].end
+		}
+		return spans[i].start < spans[j].start
+	})
+
+	merged := []span{spans[0]}
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start <= last.end {
+			last.end = max(last.end, s.end)
+			continue
+		}
+		merged = append(merged, s)
+	}
+
+	out := make([]string, 0, len(merged))
+	for _, s := range merged {
+		out = append(out, bodyByteSlice(body, s.start, s.end))
+	}
+	return out
 }
 
 // hybridScoreBreakdown exposes fused-score components for debugging.
@@ -302,7 +470,9 @@ type hybridScoreBreakdown struct {
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score *hybridScoreBreakdown `json:"score,omitempty"`
+	Score                    *hybridScoreBreakdown `json:"score,omitempty"`
+	ContextSnippets          []string              `json:"context_snippets,omitempty"`
+	ContextSnippetsTruncated bool                  `json:"context_snippets_truncated,omitempty"`
 }
 
 // hybridGenerationSummary describes the active vector-index generation
@@ -454,6 +624,23 @@ func (h *handlers) searchMessagesHybrid(
 			item.Score = sb
 		}
 		items = append(items, item)
+	}
+
+	// Enrich each hit with context snippets. mode=vector|hybrid both require
+	// free-text terms (enforced above), so we always have terms to extract from.
+	// This requires one GetMessage call per hit to access body text; the
+	// bulk GetMessageSummariesByIDs above intentionally omits body for speed.
+	for i := range items {
+		detail, err := h.engine.GetMessage(ctx, items[i].ID)
+		if err != nil || detail == nil {
+			continue
+		}
+		snippets := extractContextChar(detail.BodyText, parsed.TextTerms, searchContextChars)
+		if len(snippets) > maxContextSnippets {
+			items[i].ContextSnippetsTruncated = true
+			snippets = snippets[:maxContextSnippets]
+		}
+		items[i].ContextSnippets = snippets
 	}
 
 	var page []hybridMessageItem
@@ -627,122 +814,6 @@ func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[strin
 	return f, nil
 }
 
-// bodyByteSlice returns body[start:end], nudging boundaries inward so the
-// result is always valid UTF-8. MCP body APIs use byte offsets; without
-// this, a window can split a multibyte rune (emoji, CJK, accented letters).
-func bodyByteSlice(body string, start, end int) string {
-	if start < 0 {
-		start = 0
-	}
-	if end > len(body) {
-		end = len(body)
-	}
-	if start >= end {
-		return ""
-	}
-	for start < end && !utf8.RuneStart(body[start]) {
-		start++
-	}
-	for end > start && end < len(body) && !utf8.RuneStart(body[end]) {
-		end--
-	}
-	for end > start {
-		s := body[start:end]
-		if utf8.ValidString(s) {
-			return s
-		}
-		end--
-	}
-	return ""
-}
-
-// contextWindow returns byte offsets [start, end) for a window of up to
-// contextChars bytes centered on a match at pos with byte length termLen.
-func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
-	start = pos - (contextChars-termLen)/2
-	end = start + contextChars
-	if start < 0 {
-		start = 0
-		end = min(bodyLen, contextChars)
-	} else if end > bodyLen {
-		end = bodyLen
-		start = max(0, end-contextChars)
-	}
-	return start, end
-}
-
-func lineNumberAt(body string, byteOffset int) int {
-	if byteOffset <= 0 {
-		return 1
-	}
-	if byteOffset > len(body) {
-		byteOffset = len(body)
-	}
-	return 1 + strings.Count(body[:byteOffset], "\n")
-}
-
-// extractContextChar returns up to contextChars of body text centered on each
-// case-insensitive term match, merging overlapping windows.
-func extractContextChar(body string, terms []string, contextChars int) []string {
-	if body == "" || len(terms) == 0 || contextChars <= 0 {
-		return nil
-	}
-
-	lowerBody := strings.ToLower(body)
-
-	type span struct {
-		start, end int
-	}
-	var spans []span
-
-	for _, term := range terms {
-		if len(term) < 2 {
-			continue
-		}
-		lowerTerm := strings.ToLower(term)
-		termLen := len(term)
-		searchFrom := 0
-		for {
-			idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
-			if idx < 0 {
-				break
-			}
-			pos := searchFrom + idx
-			searchFrom = pos + 1
-
-			start, end := contextWindow(len(body), pos, termLen, contextChars)
-			spans = append(spans, span{start: start, end: end})
-		}
-	}
-
-	if len(spans) == 0 {
-		return nil
-	}
-
-	sort.Slice(spans, func(i, j int) bool {
-		if spans[i].start == spans[j].start {
-			return spans[i].end < spans[j].end
-		}
-		return spans[i].start < spans[j].start
-	})
-
-	merged := []span{spans[0]}
-	for _, s := range spans[1:] {
-		last := &merged[len(merged)-1]
-		if s.start <= last.end {
-			last.end = max(last.end, s.end)
-			continue
-		}
-		merged = append(merged, s)
-	}
-
-	out := make([]string, 0, len(merged))
-	for _, s := range merged {
-		out = append(out, bodyByteSlice(body, s.start, s.end))
-	}
-	return out
-}
-
 type getMessageResponse struct {
 	ID                   int64                  `json:"id"`
 	SourceMessageID      string                 `json:"source_message_id"`
@@ -762,8 +833,8 @@ type getMessageResponse struct {
 	Bcc                  []query.Address        `json:"bcc"`
 	BodyText             string                 `json:"body_text"`
 	BodyHTML             string                 `json:"body_html"`
-	BodyLength           int                    `json:"body_length"`
-	BodyReturned         int                    `json:"body_returned"`
+	BodyLength           int                    `json:"body_length"`   // total bytes in the full body (like total in search)
+	BodyReturned         int                    `json:"body_returned"` // bytes in this body_text chunk (like returned in search)
 	Offset               int                    `json:"offset"`
 	HasMore              bool                   `json:"has_more"`
 	Labels               []string               `json:"labels"`
@@ -1077,6 +1148,10 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 	if filter.Before, err = getDateArg(args, "before"); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if v, ok := args["conversation_id"].(float64); ok && v != 0 {
+		v2 := int64(v)
+		filter.ConversationID = &v2
+	}
 
 	results, err := h.engine.ListMessages(ctx, filter)
 	if err != nil {
@@ -1175,7 +1250,11 @@ func (h *handlers) aggregate(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	return jsonResult(rows)
 }
 
-// intArg extracts a non-negative integer from a map, with a default.
+// limitArg extracts a non-negative integer limit from a map, with a default.
+// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
+// result sets.
+// intArg extracts a non-negative integer from args without the maxLimit clamp
+// used by limitArg. Suitable for body-text offsets and similar unbounded values.
 func intArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -1187,9 +1266,6 @@ func intArg(args map[string]any, key string, def int) int {
 	return int(v)
 }
 
-// limitArg extracts a non-negative integer limit from a map, with a default.
-// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
-// result sets.
 func limitArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
