@@ -162,11 +162,15 @@ func TestSearchMessages(t *testing.T) {
 	})
 }
 
-func TestSearchFTSFirstThenFastFallback(t *testing.T) {
+// TestSearchMessages_MetadataOnly verifies that search_messages uses only the
+// fast metadata path and never calls the FTS body search engine.
+func TestSearchMessages_MetadataOnly(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
 			testutil.NewMessageSummary(3).WithSubject("Fast only").Build(),
 		},
+		// SearchResults would be returned by FTS body search — we set it to
+		// confirm search_messages never touches it.
 		SearchResults: []query.MessageSummary{
 			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
 		},
@@ -177,25 +181,43 @@ func TestSearchFTSFirstThenFastFallback(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
-	requirepkg.Len(t, resp.Data, 1, "FTS-first msgs")
-	assertpkg.Equal(t, int64(2), resp.Data[0].ID, "FTS-first ID")
+	requirepkg.Len(t, resp.Data, 1, "metadata-only results")
+	// Must return the fast result (ID 3), not the FTS result (ID 2).
+	assertpkg.Equal(t, int64(3), resp.Data[0].ID, "metadata result ID")
 }
 
-func TestSearchFallbackToFastWhenFTSEmpty(t *testing.T) {
+func TestSearchMessageBodies(t *testing.T) {
 	eng := &querytest.MockEngine{
-		SearchResults: nil,
-		SearchFastResults: []query.MessageSummary{
-			testutil.NewMessageSummary(3).WithSubject("Fast fallback").Build(),
+		SearchResults: []query.MessageSummary{
+			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
 		},
-		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
+		Messages: map[int64]*query.MessageDetail{
+			2: testutil.NewMessageDetail(2).WithBodyText("The resistor value should be 5.1k ohms.").BuildPtr(),
 		},
 	}
 	h := newTestHandlers(eng)
 
-	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
-	requirepkg.Len(t, resp.Data, 1, "fast fallback msgs")
-	assertpkg.Equal(t, int64(3), resp.Data[0].ID, "fast fallback ID")
+	t.Run("returns FTS results with context_snippets", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		resp := runTool[paginatedSearchMessages](t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "5.1k ohms"})
+		require.Len(resp.Data, 1, "data")
+		assert.Equal(int64(2), resp.Data[0].ID)
+		require.NotEmpty(resp.Data[0].ContextSnippets, "context_snippets")
+		assert.Contains(resp.Data[0].ContextSnippets[0], "5.1k")
+		// total is unknown for body search
+		assert.Equal(int64(totalCountUnknown), resp.Total, "total=-1 for FTS")
+	})
+
+	t.Run("requires free-text term", func(t *testing.T) {
+		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "from:alice"})
+		txt := resultText(t, r)
+		assertpkg.Contains(t, txt, "free-text term")
+	})
+
+	t.Run("missing query", func(t *testing.T) {
+		runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{})
+	})
 }
 
 func TestBodyByteSlice(t *testing.T) {
@@ -453,7 +475,7 @@ func TestSearchMessages_HybridPoolSaturatedAlwaysEmitted(t *testing.T) {
 }
 
 // TestSearchMessages_HybridContextSnippets verifies that mode=hybrid returns
-// context_snippets extracted from message bodies, the same as FTS mode.
+// context_snippets extracted from message bodies.
 func TestSearchMessages_HybridContextSnippets(t *testing.T) {
 	const msgID = int64(77)
 	body := strings.Repeat("a", 200) + " resistor 5.1k ohms " + strings.Repeat("z", 200)
@@ -552,6 +574,19 @@ func TestSearchMessages_UnknownMode(t *testing.T) {
 	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
 		"query": "meeting notes",
 		"mode":  "bogus",
+	})
+	txt := resultText(t, r)
+	assertpkg.Contains(t, txt, "invalid mode", "expected 'invalid mode' error, got: %s")
+}
+
+// TestSearchMessages_FTSModeRejected guards that passing mode=fts to
+// search_messages returns an error directing the caller to search_message_bodies.
+func TestSearchMessages_FTSModeRejected(t *testing.T) {
+	h := newTestHandlers(&querytest.MockEngine{})
+
+	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
+		"query": "meeting notes",
+		"mode":  "fts",
 	})
 	txt := resultText(t, r)
 	assertpkg.Contains(t, txt, "invalid mode", "expected 'invalid mode' error, got: %s")

@@ -221,6 +221,18 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 	return data, nil
 }
 
+// searchMessageItem carries a message summary plus body excerpts centered on
+// query terms. Used by searchMessageBodies and searchMessagesHybrid.
+type searchMessageItem struct {
+	query.MessageSummary
+
+	ContextSnippets          []string `json:"context_snippets,omitempty"`
+	ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
+}
+
+// searchMessages searches message metadata only (subject, sender, recipients,
+// labels, dates). Use search_message_bodies for full-body keyword search.
+// Vector and hybrid modes are delegated to searchMessagesHybrid.
 func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
@@ -230,18 +242,15 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	mode, _ := args["mode"].(string)
-	if mode == "" {
-		mode = "fts"
-	}
 	explain, _ := args["explain"].(bool)
 
 	if mode == "vector" || mode == "hybrid" {
 		return h.searchMessagesHybrid(ctx, args, queryStr, mode, explain)
 	}
 
-	if mode != "fts" {
+	if mode != "" {
 		return mcp.NewToolResultError(
-			fmt.Sprintf("invalid mode %q: must be fts, vector, or hybrid", mode),
+			fmt.Sprintf("invalid mode %q: must be vector or hybrid (or omit for metadata search)", mode),
 		), nil
 	}
 
@@ -261,18 +270,9 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 
 	filter := query.MessageFilter{SourceID: sourceID}
 
-	var results []query.MessageSummary
-	if len(q.TextTerms) > 0 {
-		results, err = h.engine.Search(ctx, q, limit, offset)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-		}
-	}
-	if len(results) == 0 {
-		results, err = h.engine.SearchFast(ctx, q, filter, limit, offset)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-		}
+	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
 
 	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
@@ -280,31 +280,59 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("search count failed: %v", err)), nil
 	}
 
-	type searchMessageItem struct {
-		query.MessageSummary
+	return jsonResult(newPaginatedResponse(results, totalMatched, offset))
+}
 
-		ContextSnippets          []string `json:"context_snippets,omitempty"`
-		ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
+// searchMessageBodies performs full-text search over message bodies and returns
+// context_snippets — short excerpts centered on each matched term. Requires at
+// least one free-text term; use search_messages for filter-only queries.
+func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	queryStr, _ := args["query"].(string)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := searchLimitArg(args)
+	offset := limitArg(args, "offset", 0)
+
+	account, _ := args["account"].(string)
+	sourceID, err := h.getAccountID(ctx, account)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	q := search.Parse(queryStr)
+	if sourceID != nil {
+		q.AccountIDs = []int64{*sourceID}
+	}
+
+	if len(q.TextTerms) == 0 {
+		return mcp.NewToolResultError("search_message_bodies requires at least one free-text term; use search_messages for filter-only queries"), nil
+	}
+
+	results, err := h.engine.Search(ctx, q, limit, offset)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
 
 	data := make([]searchMessageItem, 0, len(results))
 	for _, r := range results {
 		item := searchMessageItem{MessageSummary: r}
-		if len(q.TextTerms) > 0 {
-			msg, err := h.engine.GetMessage(ctx, r.ID)
-			if err == nil && msg != nil {
-				snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
-				if len(snippets) > maxContextSnippets {
-					item.ContextSnippetsTruncated = true
-					snippets = snippets[:maxContextSnippets]
-				}
-				item.ContextSnippets = snippets
+		msg, err := h.engine.GetMessage(ctx, r.ID)
+		if err == nil && msg != nil {
+			snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
+			if len(snippets) > maxContextSnippets {
+				item.ContextSnippetsTruncated = true
+				snippets = snippets[:maxContextSnippets]
 			}
+			item.ContextSnippets = snippets
 		}
 		data = append(data, item)
 	}
 
-	return jsonResult(newPaginatedResponse(data, totalMatched, offset))
+	return jsonResult(newPaginatedResponseHasMore(data, offset))
 }
 
 // bodyByteSlice returns body[start:end], nudging boundaries inward so the
