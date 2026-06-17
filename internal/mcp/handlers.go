@@ -386,9 +386,10 @@ func (h *handlers) searchMessagesHybrid(
 	}
 
 	maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp()
-	requestedFetch := offset + limit
-	fetchLimit := requestedFetch
-	fetchWasClamped := false
+	requestedEnd := offset + limit
+	wantedFetch := requestedEnd + 1 // probe one past the page end for has_more
+	fetchLimit := wantedFetch
+	hitMaxPageCap := false
 	if maxPage > 0 {
 		if offset >= maxPage {
 			return mcp.NewToolResultError(fmt.Sprintf(
@@ -399,7 +400,7 @@ func (h *handlers) searchMessagesHybrid(
 		}
 		if fetchLimit > maxPage {
 			fetchLimit = maxPage
-			fetchWasClamped = true
+			hitMaxPageCap = wantedFetch > maxPage
 		}
 	}
 
@@ -470,13 +471,14 @@ func (h *handlers) searchMessagesHybrid(
 		end := min(offset+limit, len(items))
 		page = items[offset:end]
 	}
-	hasMore := offset+limit < len(items)
-	// Pool saturation can mean more ranked hits exist beyond fetchLimit, but
-	// only advertise has_more when the next page is actually servable. When
-	// fetchLimit was clamped to maxPage, offset+limit may exceed maxPage and
-	// the handler would reject the follow-up request.
-	if !hasMore && !fetchWasClamped {
-		hasMore = meta.PoolSaturated && len(hits) >= fetchLimit
+	nextPageServable := maxPage == 0 || requestedEnd < maxPage
+	hasMore := false
+	if nextPageServable {
+		if requestedEnd < len(items) {
+			hasMore = true
+		} else if !hitMaxPageCap && meta.PoolSaturated && len(hits) >= fetchLimit {
+			hasMore = true
+		}
 	}
 
 	return jsonResult(searchMessagesHybridResponse{

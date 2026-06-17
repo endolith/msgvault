@@ -421,6 +421,117 @@ func TestSearchMessages_HybridPagination_NoUnreachableHasMore(t *testing.T) {
 	assert.Contains(resultText(t, r), "pagination_limit")
 }
 
+func TestSearchMessages_HybridPagination_NoHasMoreAtMaxPageBoundary(t *testing.T) {
+	// Regression: offset=30&limit=20 with max_page_size_hybrid=50 fills the
+	// ranking window (requestedEnd=50). has_more must be false even when the
+	// pool is saturated — the next page (offset=50) is rejected.
+	const maxPage = 50
+	const hitCount = 50
+	hits := make([]vector.Hit, hitCount)
+	msgs := make(map[int64]*query.MessageDetail, hitCount)
+	for i := range hitCount {
+		id := int64(i + 1)
+		hits[i] = vector.Hit{MessageID: id, Score: 1.0 - float64(i)*0.01}
+		msgs[id] = testutil.NewMessageDetail(id).WithBodyText("hit").BuildPtr()
+	}
+	backend := &fakeBackend{
+		active: vector.Generation{
+			ID: 1, Model: "fake", Dimension: 4,
+			Fingerprint: "fake:4", State: vector.GenerationActive,
+		},
+		searchHits: hits,
+	}
+	engine := hybrid.NewEngine(backend, nil, realEmbedder{dim: 4}, hybrid.Config{
+		ExpectedFingerprint: "fake:4", RRFK: 60, KPerSignal: 10,
+	})
+	h := &handlers{
+		engine:       &querytest.MockEngine{Messages: msgs},
+		hybridEngine: engine,
+		backend:      backend,
+		vectorCfg:    vector.Config{Search: vector.SearchConfig{MaxPageSizeHybrid: new(maxPage)}},
+	}
+
+	type hybridPage struct {
+		Data []struct {
+			ID int64 `json:"id"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
+		"query":  "hit",
+		"mode":   "vector",
+		"offset": float64(30),
+		"limit":  float64(20),
+	})
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	require.Len(resp.Data, 20, "data")
+	assert.False(resp.HasMore, "has_more")
+
+	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
+		"query":  "hit",
+		"mode":   "vector",
+		"offset": float64(50),
+		"limit":  float64(20),
+	})
+	assert.Contains(resultText(t, r), "pagination_limit")
+}
+
+func TestSearchMessages_HybridPagination_ProbeRowDetectsMore(t *testing.T) {
+	// Regression: hybrid must fetch offset+limit+1 rows so has_more is true
+	// when additional in-window fused results exist (not only when the pool
+	// is saturated past the ranking window).
+	const hitCount = 25
+	hits := make([]vector.Hit, hitCount)
+	msgs := make(map[int64]*query.MessageDetail, hitCount)
+	for i := range hitCount {
+		id := int64(i + 1)
+		hits[i] = vector.Hit{MessageID: id, Score: 1.0 - float64(i)*0.01}
+		msgs[id] = testutil.NewMessageDetail(id).WithBodyText("hit").BuildPtr()
+	}
+	backend := &fakeBackend{
+		active: vector.Generation{
+			ID: 1, Model: "fake", Dimension: 4,
+			Fingerprint: "fake:4", State: vector.GenerationActive,
+		},
+		searchHits: hits,
+	}
+	engine := hybrid.NewEngine(backend, nil, realEmbedder{dim: 4}, hybrid.Config{
+		ExpectedFingerprint: "fake:4", RRFK: 60, KPerSignal: 50,
+	})
+	h := &handlers{
+		engine:       &querytest.MockEngine{Messages: msgs},
+		hybridEngine: engine,
+		backend:      backend,
+		vectorCfg:    vector.Config{},
+	}
+
+	type hybridPage struct {
+		Data []struct {
+			ID int64 `json:"id"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
+		"query": "hit",
+		"mode":  "vector",
+		"limit": float64(20),
+	})
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	require.Len(resp.Data, 20, "data")
+	assert.True(resp.HasMore, "has_more")
+
+	resp2 := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
+		"query":  "hit",
+		"mode":   "vector",
+		"offset": float64(20),
+		"limit":  float64(20),
+	})
+	require.Len(resp2.Data, 5, "data page 2")
+	assert.False(resp2.HasMore, "has_more page 2")
+}
+
 func TestSearchMessages_UnknownMode(t *testing.T) {
 	h := newTestHandlers(&querytest.MockEngine{})
 
