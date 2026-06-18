@@ -348,9 +348,10 @@ func TestSearchMessages_HybridModePagination(t *testing.T) {
 		Data []struct {
 			ID int64 `json:"id"`
 		} `json:"data"`
-		Offset   int  `json:"offset"`
-		Returned int  `json:"returned"`
-		HasMore  bool `json:"has_more"`
+		Offset   int   `json:"offset"`
+		Returned int   `json:"returned"`
+		Total    int64 `json:"total"`
+		HasMore  bool  `json:"has_more"`
 	}
 	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
 		"query":  "hit",
@@ -363,13 +364,15 @@ func TestSearchMessages_HybridModePagination(t *testing.T) {
 	require.Len(resp.Data, 1, "data")
 	assert.Equal(int64(20), resp.Data[0].ID, "second ranked hit")
 	assert.Equal(1, resp.Offset, "offset")
+	assert.Equal(int64(totalCountUnknown), resp.Total, "total")
 	assert.True(resp.HasMore, "has_more")
 }
 
 func TestSearchMessages_HybridPagination_NoUnreachableHasMore(t *testing.T) {
 	// Regression: offset=40&limit=20 with max_page_size_hybrid=50 fetches the
 	// last 10 hits in-window. Pool saturation must not set has_more=true when
-	// the next page (offset=60) exceeds the ranking window.
+	// the next page (offset=60) exceeds the ranking window. total must stay -1
+	// because additional corpus matches may exist beyond the ranking window.
 	maxPage := 50
 	hits := make([]vector.Hit, maxPage)
 	msgs := make(map[int64]*query.MessageDetail, maxPage)
@@ -399,7 +402,8 @@ func TestSearchMessages_HybridPagination_NoUnreachableHasMore(t *testing.T) {
 		Data []struct {
 			ID int64 `json:"id"`
 		} `json:"data"`
-		HasMore bool `json:"has_more"`
+		Total   int64 `json:"total"`
+		HasMore bool  `json:"has_more"`
 	}
 	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
 		"query":  "hit",
@@ -410,6 +414,7 @@ func TestSearchMessages_HybridPagination_NoUnreachableHasMore(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
 	require.Len(resp.Data, 10, "data")
+	assert.Equal(int64(totalCountUnknown), resp.Total, "total")
 	assert.False(resp.HasMore, "has_more")
 
 	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
@@ -455,7 +460,8 @@ func TestSearchMessages_HybridPagination_NoHasMoreAtMaxPageBoundary(t *testing.T
 		Data []struct {
 			ID int64 `json:"id"`
 		} `json:"data"`
-		HasMore bool `json:"has_more"`
+		Total   int64 `json:"total"`
+		HasMore bool  `json:"has_more"`
 	}
 	resp := runTool[hybridPage](t, "search_messages", h.searchMessages, map[string]any{
 		"query":  "hit",
@@ -466,6 +472,7 @@ func TestSearchMessages_HybridPagination_NoHasMoreAtMaxPageBoundary(t *testing.T
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
 	require.Len(resp.Data, 20, "data")
+	assert.Equal(int64(totalCountUnknown), resp.Total, "total")
 	assert.False(resp.HasMore, "has_more")
 
 	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{

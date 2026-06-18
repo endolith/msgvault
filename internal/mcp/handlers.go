@@ -482,7 +482,7 @@ func (h *handlers) searchMessagesHybrid(
 	}
 
 	return jsonResult(searchMessagesHybridResponse{
-		paginatedResponse: newPaginatedResponseHasMore(page, offset, hasMore),
+		paginatedResponse: newPaginatedResponseNoTotal(page, offset, hasMore),
 		Mode:              mode,
 		PoolSaturated:     meta.PoolSaturated,
 		Generation: hybridGenerationSummary{
