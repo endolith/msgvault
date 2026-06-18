@@ -22,7 +22,7 @@ jobs:
             go_arch_name: arm64
     runs-on: ${{ matrix.runner }}
     container:
-      image: ubuntu:20.04
+      image: ubuntu:22.04
 
     steps:
       - name: Install build tools
@@ -44,8 +44,8 @@ jobs:
           curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${{ matrix.go_arch_name }}.tar.gz" -o go.tar.gz
           tar -C /usr/local -xzf go.tar.gz
           rm go.tar.gz
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Build
         env:
@@ -64,9 +64,11 @@ jobs:
           file dist/msgvault
           ldd dist/msgvault || true
 
-          # Verify glibc version requirement is reasonable
-          echo "--- GLIBC requirement ---"
+          # Verify runtime version requirements are reasonable. DuckDB's
+          # prebuilt static library still links against libstdc++ symbols.
+          echo "--- Runtime requirements ---"
           objdump -T dist/msgvault 2>/dev/null | grep -oP 'GLIBC_\d+\.\d+' | sort -uV | tail -1 || true
+          objdump -T dist/msgvault 2>/dev/null | grep -oP 'GLIBCXX_\d+\.\d+(\.\d+)?' | sort -uV | tail -1 || true
 
           # Smoke test
           echo "--- Smoke test ---"
