@@ -30,7 +30,7 @@ const (
 	maxSearchMessagesLimit = 50
 	defaultSearchLimit     = 20
 	maxContextSnippets     = 5
-	// searchContextChars is the max byte length of each context_snippets entry in search_messages.
+	// searchContextChars is the max byte length of each context_snippets entry in search_message_bodies.
 	searchContextChars = 300
 	defaultBodyChars   = 2000
 	// maxBodyChars caps the body slice returned by get_message regardless of what
@@ -38,8 +38,8 @@ const (
 	// the context window; callers page forward using offset.
 	maxBodyChars = 4000
 	// totalCountUnknown is returned when the backend cannot report a full match
-	// count (body FTS fallback, hybrid/vector ranking depth, or list_messages
-	// without a separate count query). Clients should use has_more for paging.
+	// count (hybrid/vector ranking depth, or list_messages without a separate
+	// count query). Clients should use has_more for paging.
 	totalCountUnknown = -1
 )
 
@@ -219,7 +219,7 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 }
 
 // searchMessageItem carries a message summary plus body excerpts centered on
-// query terms. Used by searchMessageBodies and searchMessagesHybrid.
+// query terms. Used by search_message_bodies.
 type searchMessageItem struct {
 	query.MessageSummary
 
@@ -470,9 +470,7 @@ type hybridScoreBreakdown struct {
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score                    *hybridScoreBreakdown `json:"score,omitempty"`
-	ContextSnippets          []string              `json:"context_snippets,omitempty"`
-	ContextSnippetsTruncated bool                  `json:"context_snippets_truncated,omitempty"`
+	Score *hybridScoreBreakdown `json:"score,omitempty"`
 }
 
 // hybridGenerationSummary describes the active vector-index generation
@@ -498,7 +496,8 @@ type searchMessagesHybridResponse struct {
 // hybrid engine. Mirrors api/handlers.go handleHybridSearch: returns
 // descriptive errors when the engine is not configured or the index is
 // stale/building, otherwise returns RRF-ranked hits hydrated via
-// engine.GetMessage.
+// GetMessageSummariesByIDs (body omitted — use search_message_bodies or
+// search_in_message for body content).
 func (h *handlers) searchMessagesHybrid(
 	ctx context.Context, args map[string]any,
 	queryStr, mode string, explain bool,
@@ -524,11 +523,11 @@ func (h *handlers) searchMessagesHybrid(
 
 	// mode=vector|hybrid requires at least one free-text term; filter-only
 	// queries have no query vector to rank by. Callers that want pure
-	// structured filtering should use mode=fts instead.
+	// structured filtering should omit mode (metadata search).
 	if freeText == "" {
 		return mcp.NewToolResultError(
 			"missing_free_text: mode=" + mode +
-				" requires at least one free-text term; use mode=fts for filter-only queries",
+				" requires at least one free-text term; omit mode for metadata-only search",
 		), nil
 	}
 
@@ -554,7 +553,7 @@ func (h *handlers) searchMessagesHybrid(
 		if offset >= maxPage {
 			return mcp.NewToolResultError(fmt.Sprintf(
 				"pagination_limit: offset %d exceeds hybrid ranking window (max %d); "+
-					"use mode=fts for deeper pagination",
+					"use search_messages (metadata) or search_message_bodies for deeper pagination",
 				offset, maxPage,
 			)), nil
 		}
@@ -624,23 +623,6 @@ func (h *handlers) searchMessagesHybrid(
 			item.Score = sb
 		}
 		items = append(items, item)
-	}
-
-	// Enrich each hit with context snippets. mode=vector|hybrid both require
-	// free-text terms (enforced above), so we always have terms to extract from.
-	// This requires one GetMessage call per hit to access body text; the
-	// bulk GetMessageSummariesByIDs above intentionally omits body for speed.
-	for i := range items {
-		detail, err := h.engine.GetMessage(ctx, items[i].ID)
-		if err != nil || detail == nil {
-			continue
-		}
-		snippets := extractContextChar(detail.BodyText, parsed.TextTerms, searchContextChars)
-		if len(snippets) > maxContextSnippets {
-			items[i].ContextSnippetsTruncated = true
-			snippets = snippets[:maxContextSnippets]
-		}
-		items[i].ContextSnippets = snippets
 	}
 
 	var page []hybridMessageItem

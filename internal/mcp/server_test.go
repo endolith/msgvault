@@ -747,7 +747,7 @@ func TestSearchMessages_FTSModeRejected(t *testing.T) {
 
 	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
 		"query": "meeting notes",
-		"mode":  "fts",
+		"mode":  searchModeFTS,
 	})
 	txt := resultText(t, r)
 	assertpkg.Contains(t, txt, "invalid mode", "expected 'invalid mode' error, got: %s")
