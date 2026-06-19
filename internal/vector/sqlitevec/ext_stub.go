@@ -115,3 +115,8 @@ func (b *Backend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error {
 func (b *Backend) LoadVector(_ context.Context, _ int64) ([]float32, error) {
 	return nil, ErrNotBuilt
 }
+
+// ScoreMessageChunks is a stub that always returns ErrNotBuilt.
+func (b *Backend) ScoreMessageChunks(_ context.Context, _ vector.GenerationID, _ int64, _ []float32) ([]vector.ChunkHit, error) {
+	return nil, ErrNotBuilt
+}

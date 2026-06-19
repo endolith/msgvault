@@ -61,8 +61,8 @@ type paginatedSearchMessages struct {
 type searchMessageRow struct {
 	query.MessageSummary
 
-	ContextSnippets          []string `json:"context_snippets"`
-	ContextSnippetsTruncated bool     `json:"context_snippets_truncated"`
+	Matches          []messageMatch `json:"matches"`
+	MatchesTruncated bool           `json:"matches_truncated"`
 }
 
 type getMessageResp struct {
@@ -78,11 +78,11 @@ type getMessageResp struct {
 }
 
 type paginatedInMessageMatches struct {
-	Data     []inMessageMatch `json:"data"`
-	Total    int64            `json:"total"`
-	Returned int              `json:"returned"`
-	Offset   int              `json:"offset"`
-	HasMore  bool             `json:"has_more"`
+	Data     []messageMatch `json:"data"`
+	Total    int64          `json:"total"`
+	Returned int            `json:"returned"`
+	Offset   int            `json:"offset"`
+	HasMore  bool           `json:"has_more"`
 }
 
 type paginatedListMessages struct {
@@ -237,8 +237,8 @@ func TestSearchMessageBodies(t *testing.T) {
 		resp := runTool[paginatedSearchMessages](t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "5.1k ohms"})
 		require.Len(resp.Data, 1, "data")
 		assert.Equal(int64(2), resp.Data[0].ID)
-		require.NotEmpty(resp.Data[0].ContextSnippets, "context_snippets")
-		assert.Contains(resp.Data[0].ContextSnippets[0], "5.1k")
+		require.NotEmpty(resp.Data[0].Matches, "matches")
+		assert.Contains(resp.Data[0].Matches[0].Snippet, "5.1k")
 		assert.Equal(int64(totalCountUnknown), resp.Total, "total=-1 for FTS")
 	})
 
@@ -1782,6 +1782,8 @@ type fakeBackend struct {
 	activeErr   error
 	searchHits  []vector.Hit
 	searchErr   error
+	chunkHits   map[int64][]vector.ChunkHit
+	chunkErr    error
 	fusedHits   []vector.FusedHit
 	fusedErr    error
 	building    *vector.Generation
@@ -1798,6 +1800,15 @@ func (f *fakeBackend) ActiveGeneration(_ context.Context) (vector.Generation, er
 }
 func (f *fakeBackend) Search(_ context.Context, _ vector.GenerationID, _ []float32, _ int, _ vector.Filter) ([]vector.Hit, error) {
 	return f.searchHits, f.searchErr
+}
+func (f *fakeBackend) ScoreMessageChunks(_ context.Context, _ vector.GenerationID, messageID int64, _ []float32) ([]vector.ChunkHit, error) {
+	if f.chunkErr != nil {
+		return nil, f.chunkErr
+	}
+	if f.chunkHits != nil {
+		return f.chunkHits[messageID], nil
+	}
+	return nil, nil
 }
 func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
 	if f.fusedErr != nil {
@@ -1847,8 +1858,9 @@ func (f *fakeBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) err
 }
 
 var (
-	_ vector.Backend       = (*fakeBackend)(nil)
-	_ vector.FusingBackend = (*fakeBackend)(nil)
+	_ vector.Backend             = (*fakeBackend)(nil)
+	_ vector.FusingBackend       = (*fakeBackend)(nil)
+	_ vector.ChunkScoringBackend = (*fakeBackend)(nil)
 )
 
 // similarResponse matches the JSON response shape of find_similar_messages.
