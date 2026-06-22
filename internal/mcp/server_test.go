@@ -1561,6 +1561,29 @@ func TestSearchMessagesTool_AdvertisesVectorModesOnlyWhenAvailable(t *testing.T)
 	assert.Contains(enabled.Description, "free-text", "vectorAvailable=true: tool description should call out the free-text requirement, got: %q", enabled.Description)
 }
 
+// TestSearchMessagesTool_DocumentsQuerySyntax guards the operator-support
+// contract so clients do not assume full Gmail compatibility.
+func TestSearchMessagesTool_DocumentsQuerySyntax(t *testing.T) {
+	assert := assertpkg.New(t)
+	for _, vectorAvailable := range []bool{false, true} {
+		tool := searchMessagesTool(vectorAvailable)
+		desc := tool.Description
+		for _, want := range []string{
+			"cc:",
+			"bcc:",
+			"older_than:",
+			"Not supported: negation",
+			"subject, snippet, and sender",
+		} {
+			assert.Contains(desc, want, "vectorAvailable=%v: description missing %q", vectorAvailable, want)
+		}
+		assert.NotContains(desc, "Gmail-like", "vectorAvailable=%v: description should not over-promise Gmail compatibility", vectorAvailable)
+
+		queryDesc := tool.InputSchema.Properties["query"].Description
+		assert.Contains(queryDesc, "supported operators", "vectorAvailable=%v: query param should reference operator docs", vectorAvailable)
+	}
+}
+
 func TestFindSimilarMessages_MissingID(t *testing.T) {
 	h := &handlers{
 		engine:  &querytest.MockEngine{},

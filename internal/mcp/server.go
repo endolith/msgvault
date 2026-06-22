@@ -190,16 +190,34 @@ func ServeHTTPWithOptions(ctx context.Context, opts ServeOptions, addr string) e
 	}
 }
 
+// Shared search_messages schema text. The parser implements a subset of Gmail
+// syntax — not full Gmail compatibility. Keep this in sync with
+// internal/search/parser.go and the SearchFast → Search fallback in handlers.go.
+const (
+	searchMessagesOperatorDoc = "Supported operators: from:, to:, cc:, bcc:, subject:, label: (or l:), has:attachment, " +
+		"before:/after: (YYYY-MM-DD), older_than:/newer_than: (e.g. 7d, 2w, 1m, 1y), larger:/smaller: (e.g. 5M). " +
+		"Bare domains on from:/to: match any address at that domain. Multiple terms are ANDed. " +
+		"Not supported: negation (-), OR, or parentheses grouping."
+	searchMessagesFreeTextDoc = "Free text matches subject, snippet, and sender fields first; " +
+		"if that returns no results, falls back to full-text search including message bodies (when the FTS index is available)."
+	searchMessagesPaginationDoc = "Paginate with offset/limit (default limit 20, max 50). " +
+		"Response: data, total, returned, offset, has_more."
+)
+
 func searchMessagesTool(vectorAvailable bool) mcp.Tool {
+	searchIntro := "Search emails using a subset of Gmail query syntax (not full Gmail compatibility). " +
+		searchMessagesOperatorDoc + " " + searchMessagesFreeTextDoc + " "
+	queryDesc := "Search query (e.g. 'from:alice subject:meeting after:2024-01-01'). " +
+		"See tool description for supported operators and limitations."
+
 	if !vectorAvailable {
 		return mcp.NewTool(ToolSearchMessages,
-			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-				"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
-				"(This server is not configured for vector search; only keyword FTS is available.)"),
+			mcp.WithDescription(searchIntro+searchMessagesPaginationDoc+
+				" (This server is not configured for vector search; only keyword FTS is available.)"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("query",
 				mcp.Required(),
-				mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01')"),
+				mcp.Description(queryDesc),
 			),
 			withAccount(),
 			withLimit("20"),
@@ -207,15 +225,15 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 		)
 	}
 	return mcp.NewTool(ToolSearchMessages,
-		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
-			"All modes paginate via offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
+		mcp.WithDescription(searchIntro+searchMessagesPaginationDoc+
 			"total=-1 means the full match count is unknown — use has_more. "+
 			"Vector/hybrid ranking depth is capped by max_page_size_hybrid in config; beyond that use mode=fts. "+
-			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
+			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. "+
+			"Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01'); mode=vector|hybrid require at least one free-text term"),
+			mcp.Description(queryDesc+"; mode=vector|hybrid require at least one free-text term"),
 		),
 		withAccount(),
 		withLimit("20"),
