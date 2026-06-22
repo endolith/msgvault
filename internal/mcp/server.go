@@ -275,7 +275,7 @@ func getMessageTool() mcp.Tool {
 			mcp.Description("Byte offset from the start of body_text to center the window on (e.g. char_offset from search_in_message). Takes precedence over offset."),
 		),
 		mcp.WithNumber("max_chars",
-			mcp.Description("Maximum body_text bytes to return (default 2000, max 4000). Out-of-range values are silently replaced with the default."),
+			mcp.Description("Maximum body_text bytes to return (default 2000, max 4000). Values above 4000 are clamped to 4000; zero or negative values use the default."),
 		),
 	)
 }

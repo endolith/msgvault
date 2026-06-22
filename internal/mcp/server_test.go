@@ -844,6 +844,42 @@ func TestGetMessage(t *testing.T) {
 		assertpkg.Equal(t, 0, msg.Offset, "starts at body start")
 	})
 
+	t.Run("max_chars above cap clamps to 4000", func(t *testing.T) {
+		assert := assertpkg.New(t)
+		longBody := strings.Repeat("x", 5000)
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				54: testutil.NewMessageDetail(54).WithBodyText(longBody).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{
+			"id":        float64(54),
+			"max_chars": float64(5000),
+		})
+		assert.Equal(4000, msg.BodyReturned, "body_returned")
+		assert.Len(msg.BodyText, 4000, "clamped body_text")
+		assert.True(msg.HasMore, "has_more")
+	})
+
+	t.Run("max_chars zero uses default", func(t *testing.T) {
+		assert := assertpkg.New(t)
+		longBody := strings.Repeat("x", 5000)
+		eng2 := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				55: testutil.NewMessageDetail(55).WithBodyText(longBody).BuildPtr(),
+			},
+		}
+		h2 := newTestHandlers(eng2)
+		msg := runTool[getMessageResp](t, "get_message", h2.getMessage, map[string]any{
+			"id":        float64(55),
+			"max_chars": float64(0),
+		})
+		assert.Equal(2000, msg.BodyReturned, "body_returned")
+		assert.Len(msg.BodyText, 2000, "default body_text")
+		assert.True(msg.HasMore, "has_more")
+	})
+
 	errorCases := []struct {
 		name string
 		args map[string]any

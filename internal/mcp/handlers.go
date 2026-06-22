@@ -837,8 +837,10 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}
 
 	maxChars := intArg(args, "max_chars", defaultBodyChars)
-	if maxChars <= 0 || maxChars > maxBodyChars {
+	if maxChars <= 0 {
 		maxChars = defaultBodyChars
+	} else if maxChars > maxBodyChars {
+		maxChars = maxBodyChars
 	}
 
 	fullBody := msg.BodyText
