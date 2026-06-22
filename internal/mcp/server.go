@@ -242,7 +242,10 @@ func searchMessageBodiesTool() mcp.Tool {
 	return mcp.NewTool(ToolSearchMessageBodies,
 		mcp.WithDescription("Search message bodies by keyword using full-text search (FTS). Returns messages whose body text contains the search terms, "+
 			"plus context_snippets — short excerpts (up to 5 per message, 300 bytes each) centered on each matched term. "+
-			"Requires at least one free-text term; use search_messages for filter-only queries (from:, label:, etc.). "+
+			"Requires at least one free-text term (bare word or double-quoted phrase). "+
+			"Known Gmail operators (from:, subject:, label:, etc.) apply as metadata filters only and do not satisfy the free-text requirement; "+
+			"filter-only queries such as from:alice are rejected — use search_messages instead. "+
+			"Unrecognized word:value tokens (e.g. RXD2:V2) are treated as literal body text, not filters. "+
 			"Query syntax: space-separated words are ANDed (each must appear somewhere in the body); "+
 			"a double-quoted phrase is one exact phrase (e.g. \"RXD2 V2\"); OR and NOT are not supported. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, returned, offset, has_more. "+
@@ -250,9 +253,11 @@ func searchMessageBodiesTool() mcp.Tool {
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description("Body keyword query with at least one free-text term. "+
-				"Space-separated words are ANDed (RXD2 V2 = both terms anywhere); "+
-				"double quotes match an exact phrase (\"RXD2 V2\"). OR/NOT unsupported."),
+			mcp.Description("Body keyword query with at least one free-text term (bare word or quoted phrase). "+
+				"Gmail operators (from:, subject:, etc.) are metadata filters, not body search — "+
+				"subject:test alone is rejected; combine with body terms (from:alice budget) or use search_messages for filter-only queries. "+
+				"Unrecognized word:value tokens (RXD2:V2) are literal text. "+
+				"Space-separated words are ANDed; double quotes match an exact phrase; OR/NOT unsupported."),
 		),
 		withAccount(),
 		withLimit("20"),

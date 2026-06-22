@@ -306,7 +306,11 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	if len(q.TextTerms) == 0 {
-		return mcp.NewToolResultError("search_message_bodies requires at least one free-text term; use search_messages for filter-only queries"), nil
+		return mcp.NewToolResultError(
+			"search_message_bodies requires at least one free-text term (bare word or quoted phrase); " +
+				"Gmail operators such as from: or subject: are metadata filters and do not count — " +
+				"use search_messages for filter-only queries",
+		), nil
 	}
 
 	results, err := h.engine.Search(ctx, q, limit+1, offset)

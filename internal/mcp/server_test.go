@@ -246,6 +246,7 @@ func TestSearchMessageBodies(t *testing.T) {
 		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "from:alice"})
 		txt := resultText(t, r)
 		assertpkg.Contains(t, txt, "free-text term")
+		assertpkg.Contains(t, txt, "metadata filters")
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -1909,6 +1910,22 @@ func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
 	assert.Contains(queryDesc, "ANDed", "query param should document implicit AND, got: %q", queryDesc)
 	assert.Contains(queryDesc, "double quotes", "query param should document phrase matching, got: %q", queryDesc)
 	assert.Contains(queryDesc, "OR/NOT unsupported", "query param should document missing boolean ops, got: %q", queryDesc)
+}
+
+// TestSearchMessageBodiesTool_DocumentsFilterVsFreeText guards the contract
+// that Gmail operators are metadata filters and unrecognized word:value
+// tokens are literal body text.
+func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
+	assert := assertpkg.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "metadata filters", "tool description should distinguish filters from free text, got: %q", tool.Description)
+	assert.Contains(tool.Description, "Unrecognized word:value", "tool description should document literal colon tokens, got: %q", tool.Description)
+
+	queryDesc := tool.InputSchema.Properties["query"].Description
+	assert.Contains(queryDesc, "metadata filters", "query param should distinguish filters from free text, got: %q", queryDesc)
+	assert.Contains(queryDesc, "subject:test alone is rejected", "query param should warn subject: is not free text, got: %q", queryDesc)
+	assert.Contains(queryDesc, "Unrecognized word:value", "query param should document literal colon tokens, got: %q", queryDesc)
 }
 
 func TestFindSimilarMessages_MissingID(t *testing.T) {
