@@ -1895,6 +1895,22 @@ func TestSearchMessagesTool_AdvertisesVectorModesOnlyWhenAvailable(t *testing.T)
 	assert.Contains(enabled.Description, "free-text", "vectorAvailable=true: tool description should call out the free-text requirement, got: %q", enabled.Description)
 }
 
+// TestSearchMessageBodiesTool_DocumentsQuerySyntax guards the query-syntax
+// contract so MCP clients know how body FTS interprets free-text terms.
+func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
+	assert := assertpkg.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "ANDed", "tool description should document implicit AND, got: %q", tool.Description)
+	assert.Contains(tool.Description, "double-quoted phrase", "tool description should document phrase matching, got: %q", tool.Description)
+	assert.Contains(tool.Description, "OR and NOT are not supported", "tool description should document missing boolean ops, got: %q", tool.Description)
+
+	queryDesc := tool.InputSchema.Properties["query"].Description
+	assert.Contains(queryDesc, "ANDed", "query param should document implicit AND, got: %q", queryDesc)
+	assert.Contains(queryDesc, "double quotes", "query param should document phrase matching, got: %q", queryDesc)
+	assert.Contains(queryDesc, "OR/NOT unsupported", "query param should document missing boolean ops, got: %q", queryDesc)
+}
+
 func TestFindSimilarMessages_MissingID(t *testing.T) {
 	h := &handlers{
 		engine:  &querytest.MockEngine{},

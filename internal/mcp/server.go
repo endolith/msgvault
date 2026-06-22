@@ -243,12 +243,16 @@ func searchMessageBodiesTool() mcp.Tool {
 		mcp.WithDescription("Search message bodies by keyword using full-text search (FTS). Returns messages whose body text contains the search terms, "+
 			"plus context_snippets — short excerpts (up to 5 per message, 300 bytes each) centered on each matched term. "+
 			"Requires at least one free-text term; use search_messages for filter-only queries (from:, label:, etc.). "+
+			"Query syntax: space-separated words are ANDed (each must appear somewhere in the body); "+
+			"a double-quoted phrase is one exact phrase (e.g. \"RXD2 V2\"); OR and NOT are not supported. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, returned, offset, has_more. "+
 			"(total is not available for body search; use has_more to detect more pages.)"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description("Search query with at least one free-text term (e.g. 'quarterly report' or 'from:alice budget')"),
+			mcp.Description("Body keyword query with at least one free-text term. "+
+				"Space-separated words are ANDed (RXD2 V2 = both terms anywhere); "+
+				"double quotes match an exact phrase (\"RXD2 V2\"). OR/NOT unsupported."),
 		),
 		withAccount(),
 		withLimit("20"),
