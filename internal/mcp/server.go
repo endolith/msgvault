@@ -320,11 +320,12 @@ func getStatsTool() mcp.Tool {
 
 func aggregateTool() mcp.Tool {
 	return mcp.NewTool(ToolAggregate,
-		mcp.WithDescription("Get grouped statistics (e.g. top senders, domains, labels, or message volume over time)."),
+		mcp.WithDescription("Get grouped statistics (top senders, recipients, domains, labels, or message volume by calendar year). "+
+			"Returns a JSON array of objects with fields Key, Count, TotalSize, AttachmentSize, AttachmentCount, and TotalUnique."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("group_by",
 			mcp.Required(),
-			mcp.Description("Dimension to group by"),
+			mcp.Description("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\")."),
 			mcp.Enum("sender", "recipient", "domain", "label", "time"),
 		),
 		withAccount(),

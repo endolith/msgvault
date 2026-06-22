@@ -688,6 +688,20 @@ func TestGetStats_VectorEnabled(t *testing.T) {
 	assert.Nil(resp.VectorSearch.BuildingGeneration, "building_generation")
 }
 
+// TestAggregateTool_DocumentsTimeGranularity guards the group_by=time contract:
+// MCP always buckets by calendar year (the handler does not set TimeGranularity).
+func TestAggregateTool_DocumentsTimeGranularity(t *testing.T) {
+	tool := aggregateTool()
+	desc := tool.Description
+	groupByDesc := tool.InputSchema.Properties["group_by"].Description
+
+	assert := assertpkg.New(t)
+	assert.Contains(desc, "calendar year", "tool description should document yearly time buckets")
+	assert.Contains(desc, "TotalUnique", "tool description should list response fields")
+	assert.Contains(groupByDesc, "calendar year", "group_by description should document yearly granularity")
+	assert.Contains(groupByDesc, `"2024"`, "group_by description should show example year key")
+}
+
 func TestAggregate(t *testing.T) {
 	eng := &querytest.MockEngine{
 		AggregateRows: []query.AggregateRow{

@@ -55,7 +55,7 @@ The MCP server exposes the following tools to connected AI clients:
 | `get_attachment` | Get attachment content by ID | `attachment_id` (int) |
 | `export_attachment` | Save attachment to filesystem | `attachment_id` (int), `destination` (string) |
 | `get_stats` | Archive overview statistics. Includes vector index state when configured. | — |
-| `aggregate` | Grouped statistics (top senders, domains, labels, time series) | `group_by` (string: sender/recipient/domain/label/time), `limit` (int), `after` (string), `before` (string), `account` (string) |
+| `aggregate` | Grouped statistics (top senders, domains, labels, or message volume by calendar year) | `group_by` (string: sender/recipient/domain/label/time), `limit` (int), `after` (string), `before` (string), `account` (string) |
 | `stage_deletion` | Stage messages for deletion (creates manifest only) | `query` (string) OR structured filters: `from` (string), `domain` (string), `label` (string), `after` (string), `before` (string), `has_attachment` (bool); optional: `account` (string) |
 
 `search_messages` and `list_messages` return paginated JSON:
@@ -83,6 +83,21 @@ Supported operators: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:` (or `l:
 Not supported: negation (`-has:attachment`), `OR`, or parentheses grouping.
 
 Free text matches subject, snippet, and sender fields first. If that returns no results, the server falls back to full-text search including message bodies (when the FTS index is available).
+
+### `aggregate` response
+
+`group_by=time` buckets messages by **calendar year** only. Each row's `Key` is a year string (e.g. `"2024"`). Month or day granularity is not available via MCP.
+
+All `group_by` values return a JSON array of objects with these fields:
+
+| Field | Description |
+|---|---|
+| `Key` | Grouping value (email, domain, label name, or year) |
+| `Count` | Number of messages in the group |
+| `TotalSize` | Sum of `size_estimate` in bytes |
+| `AttachmentSize` | Sum of attachment sizes in bytes |
+| `AttachmentCount` | Number of attachments |
+| `TotalUnique` | Total number of distinct groups (same on every row) |
 
 `find_similar_messages` is only registered when the server starts with vector search configured. `search_messages` is always available, but `mode=vector` and `mode=hybrid` return `vector_not_enabled` when the server is not configured for vector search. Vector and hybrid queries require at least one free-text term (operator-only queries return `missing_free_text`). They support `offset`/`limit` pagination inside the configured hybrid ranking window; when `[vector.search].max_page_size_hybrid` is positive, an `offset` at or beyond that cap returns `pagination_limit`. Use `mode=fts` for deeper pagination or adjust that config cap.
 
