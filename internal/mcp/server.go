@@ -242,6 +242,7 @@ func searchMessageBodiesTool() mcp.Tool {
 	return mcp.NewTool(ToolSearchMessageBodies,
 		mcp.WithDescription("Search message bodies by keyword using full-text search (FTS). Returns messages whose body text contains the search terms, "+
 			"plus context_snippets — short excerpts (up to 5 per message, 300 bytes each) centered on each matched term. "+
+			"When context_snippets_truncated is true on a hit, more than 5 excerpts matched — use search_in_message or get_message to read the full body. "+
 			"Requires at least one free-text term (bare word or double-quoted phrase). "+
 			"Known Gmail operators (from:, subject:, label:, etc.) apply as metadata filters only and do not satisfy the free-text requirement; "+
 			"filter-only queries such as from:alice are rejected — use search_messages instead. "+

@@ -224,7 +224,9 @@ type searchMessageItem struct {
 	query.MessageSummary
 
 	ContextSnippets          []string `json:"context_snippets,omitempty"`
-	ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
+	// ContextSnippetsTruncated is true when more than maxContextSnippets (5)
+	// match excerpts were found; only the first 5 are returned.
+	ContextSnippetsTruncated bool `json:"context_snippets_truncated,omitempty"`
 }
 
 // searchMessages searches message metadata only (subject, sender, recipients,

@@ -242,6 +242,29 @@ func TestSearchMessageBodies(t *testing.T) {
 		assert.Equal(int64(totalCountUnknown), resp.Total, "total=-1 for FTS")
 	})
 
+	t.Run("sets context_snippets_truncated when excerpts exceed cap", func(t *testing.T) {
+		require := requirepkg.New(t)
+		assert := assertpkg.New(t)
+		var body strings.Builder
+		for range 7 {
+			body.WriteString("needle")
+			body.WriteString(strings.Repeat("x", 400))
+		}
+		eng := &querytest.MockEngine{
+			SearchResults: []query.MessageSummary{
+				testutil.NewMessageSummary(3).WithSubject("Many hits").Build(),
+			},
+			Messages: map[int64]*query.MessageDetail{
+				3: testutil.NewMessageDetail(3).WithBodyText(body.String()).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+		resp := runTool[paginatedSearchMessages](t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "needle"})
+		require.Len(resp.Data, 1)
+		assert.Len(resp.Data[0].ContextSnippets, maxContextSnippets)
+		assert.True(resp.Data[0].ContextSnippetsTruncated)
+	})
+
 	t.Run("requires free-text term", func(t *testing.T) {
 		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "from:alice"})
 		txt := resultText(t, r)
@@ -1926,6 +1949,20 @@ func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
 	assert.Contains(queryDesc, "metadata filters", "query param should distinguish filters from free text, got: %q", queryDesc)
 	assert.Contains(queryDesc, "subject:test alone is rejected", "query param should warn subject: is not free text, got: %q", queryDesc)
 	assert.Contains(queryDesc, "Unrecognized word:value", "query param should document literal colon tokens, got: %q", queryDesc)
+}
+
+// TestSearchMessageBodiesTool_DocumentsContextSnippetsTruncated guards the
+// response-field contract for when excerpt lists are capped.
+func TestSearchMessageBodiesTool_DocumentsContextSnippetsTruncated(t *testing.T) {
+	assert := assertpkg.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "context_snippets_truncated",
+		"tool description should document context_snippets_truncated, got: %q", tool.Description)
+	assert.Contains(tool.Description, "search_in_message",
+		"tool description should point callers to search_in_message, got: %q", tool.Description)
+	assert.Contains(tool.Description, "get_message",
+		"tool description should point callers to get_message, got: %q", tool.Description)
 }
 
 func TestFindSimilarMessages_MissingID(t *testing.T) {
