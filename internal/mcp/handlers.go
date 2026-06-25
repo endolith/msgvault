@@ -318,6 +318,8 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 type searchMessageItem struct {
 	query.MessageSummary
 
+	// MatchesTruncated is true when more than maxContextSnippets (5) match
+	// excerpts were found; only the first 5 are returned.
 	Matches          []messageMatch `json:"matches,omitempty"`
 	MatchesTruncated bool           `json:"matches_truncated,omitempty"`
 }
@@ -401,7 +403,7 @@ func unsupportedSearchOperatorMessage(q *search.Query) string {
 }
 
 // searchMessageBodies performs full-text search over message bodies and returns
-// context_snippets — short excerpts centered on each matched term. Requires at
+// matches — short excerpts centered on each matched term. Requires at
 // least one free-text term; use search_messages for filter-only queries.
 func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
@@ -429,7 +431,11 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	if len(q.TextTerms) == 0 {
-		return mcp.NewToolResultError("search_message_bodies requires at least one free-text term; use search_messages for filter-only queries"), nil
+		return mcp.NewToolResultError(
+			"search_message_bodies requires at least one free-text term (bare word or quoted phrase); " +
+				"Gmail operators such as from: or subject: are metadata filters and do not count — " +
+				"use search_messages for filter-only queries",
+		), nil
 	}
 
 	results, err := h.engine.Search(ctx, q, limit+1, offset)
