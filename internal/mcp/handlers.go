@@ -313,13 +313,13 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 	return data, nil
 }
 
-// searchMessageItem carries a message summary plus body excerpts centered on
-// query terms. Used by search_message_bodies.
+// searchMessageItem carries a message summary plus body match excerpts.
+// Used by search_message_bodies.
 type searchMessageItem struct {
 	query.MessageSummary
 
-	ContextSnippets          []string `json:"context_snippets,omitempty"`
-	ContextSnippetsTruncated bool     `json:"context_snippets_truncated,omitempty"`
+	Matches          []messageMatch `json:"matches,omitempty"`
+	MatchesTruncated bool           `json:"matches_truncated,omitempty"`
 }
 
 // searchMessages searches message metadata only (subject, sender, recipients,
@@ -447,12 +447,12 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		item := searchMessageItem{MessageSummary: r}
 		msg, err := h.engine.GetMessage(ctx, r.ID)
 		if err == nil && msg != nil {
-			snippets := extractContextChar(msg.BodyText, q.TextTerms, searchContextChars)
-			if len(snippets) > maxContextSnippets {
-				item.ContextSnippetsTruncated = true
-				snippets = snippets[:maxContextSnippets]
+			matches := extractContextMatches(msg.BodyText, q.TextTerms, searchContextChars)
+			if len(matches) > maxContextSnippets {
+				item.MatchesTruncated = true
+				matches = matches[:maxContextSnippets]
 			}
-			item.ContextSnippets = snippets
+			item.Matches = matches
 		}
 		data = append(data, item)
 	}
@@ -475,11 +475,14 @@ type hybridScoreBreakdown struct {
 
 // hybridMessageItem is a single hit in a vector/hybrid response. The
 // embedded MessageSummary carries the standard message fields; Score is
-// present only when explain=true was requested.
+// present only when explain=true was requested. Matches lists the best
+// scoring embedded chunks for the query within this message.
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score *hybridScoreBreakdown `json:"score,omitempty"`
+	Score            *hybridScoreBreakdown `json:"score,omitempty"`
+	Matches          []messageMatch        `json:"matches,omitempty"`
+	MatchesTruncated bool                  `json:"matches_truncated,omitempty"`
 }
 
 // HybridGeneration describes the active vector-index generation used to answer
@@ -647,6 +650,10 @@ func (h *handlers) searchMessagesHybrid(
 		end := min(offset+limit, len(items))
 		page = items[offset:end]
 	}
+
+	minScore := floatArg(args, "min_score", 0)
+	h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore)
+
 	nextPageServable := maxPage == 0 || requestedEnd < maxPage
 	hasMore := false
 	if nextPageServable {
@@ -1233,10 +1240,106 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 	})
 }
 
-type inMessageMatch struct {
-	CharOffset int    `json:"char_offset"`
-	Snippet    string `json:"snippet"`
-	Line       int    `json:"line"`
+func (h *handlers) attachVectorChunkMatches(
+	ctx context.Context,
+	genID vector.GenerationID,
+	queryVec []float32,
+	items []hybridMessageItem,
+	minScore float64,
+) {
+	scorer, ok := h.backend.(vector.ChunkScoringBackend)
+	if !ok || len(queryVec) == 0 || len(items) == 0 {
+		return
+	}
+	for i := range items {
+		msg, err := h.engine.GetMessage(ctx, items[i].ID)
+		if err != nil || msg == nil {
+			continue
+		}
+		chunkHits, err := scorer.ScoreMessageChunks(ctx, genID, msg.ID, queryVec)
+		if err != nil {
+			continue
+		}
+		preprocessed := preprocessedEmbedText(msg.Subject, msg.BodyText, h.vectorCfg)
+		prefixRunes := subjectPrefixRuneCount(msg.Subject)
+		matches, truncated := chunkHitsToMatches(
+			preprocessed, msg.BodyText, prefixRunes,
+			chunkHits, minScore, maxContextSnippets,
+		)
+		items[i].Matches = matches
+		items[i].MatchesTruncated = truncated
+	}
+}
+
+func (h *handlers) vectorMatchesInMessage(
+	ctx context.Context,
+	messageID int64,
+	queryStr string,
+	minScore float64,
+	limit, offset int,
+) (*mcp.CallToolResult, error) {
+	if h.hybridEngine == nil || h.backend == nil {
+		return mcp.NewToolResultError(
+			"vector_not_enabled: vector search is not configured on this server",
+		), nil
+	}
+	scorer, ok := h.backend.(vector.ChunkScoringBackend)
+	if !ok {
+		return mcp.NewToolResultError(
+			"vector_not_enabled: chunk scoring is not available on this backend",
+		), nil
+	}
+
+	active, err := h.backend.ActiveGeneration(ctx)
+	if err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("active generation: %v", err)), nil
+	}
+	if _, err := vector.ResolveActiveForFingerprint(ctx, h.backend, h.vectorCfg.GenerationFingerprint()); err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("vector index: %v", err)), nil
+	}
+
+	queryVec, err := h.hybridEngine.EmbedQuery(ctx, queryStr)
+	if err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("embed query: %v", err)), nil
+	}
+
+	msg, err := h.engine.GetMessage(ctx, messageID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+
+	chunkHits, err := scorer.ScoreMessageChunks(ctx, active.ID, messageID, queryVec)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("score chunks: %v", err)), nil
+	}
+
+	preprocessed := preprocessedEmbedText(msg.Subject, msg.BodyText, h.vectorCfg)
+	prefixRunes := subjectPrefixRuneCount(msg.Subject)
+	allMatches, _ := chunkHitsToMatches(
+		preprocessed, msg.BodyText, prefixRunes,
+		chunkHits, minScore, len(chunkHits),
+	)
+
+	total := int64(len(allMatches))
+	if offset >= len(allMatches) {
+		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
+	}
+	end := min(offset+limit, len(allMatches))
+	page := allMatches[offset:end]
+	// Re-cap page length after pagination.
+	if len(page) > limit {
+		page = page[:limit]
+	}
+	return jsonResult(newPaginatedResponse(page, total, offset))
 }
 
 func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1253,8 +1356,20 @@ func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError("query parameter is required"), nil
 	}
 
+	mode, _ := args["mode"].(string)
 	limit := limitArg(args, "limit", 10)
 	offset := limitArg(args, "offset", 0)
+
+	switch mode {
+	case "", "keyword":
+		// default: literal term search
+	case searchModeVector:
+		return h.vectorMatchesInMessage(ctx, id, queryStr, floatArg(args, "min_score", 0), limit, offset)
+	default:
+		return mcp.NewToolResultError(
+			fmt.Sprintf("invalid mode %q: must be keyword (default) or %s", mode, searchModeVector),
+		), nil
+	}
 
 	msg, err := h.engine.GetMessage(ctx, id)
 	if err != nil {
@@ -1267,20 +1382,20 @@ func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest)
 	allMatches := findTermMatches(msg.BodyText, queryStr)
 	total := int64(len(allMatches))
 	if offset >= len(allMatches) {
-		return jsonResult(newPaginatedResponse([]inMessageMatch{}, total, offset))
+		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
 	}
 	end := min(offset+limit, len(allMatches))
 	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
 }
 
-func findTermMatches(body, term string) []inMessageMatch {
+func findTermMatches(body, term string) []messageMatch {
 	if body == "" || term == "" {
 		return nil
 	}
 	lowerBody := strings.ToLower(body)
 	lowerTerm := strings.ToLower(term)
 	termLen := len(term)
-	var matches []inMessageMatch
+	var matches []messageMatch
 	searchFrom := 0
 	for {
 		idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
@@ -1290,7 +1405,7 @@ func findTermMatches(body, term string) []inMessageMatch {
 		pos := searchFrom + idx
 		searchFrom = pos + 1
 		start, end := contextWindow(len(body), pos, termLen, searchContextChars)
-		matches = append(matches, inMessageMatch{
+		matches = append(matches, messageMatch{
 			CharOffset: pos,
 			Snippet:    bodyByteSlice(body, start, end),
 			Line:       lineNumberAt(body, pos),
