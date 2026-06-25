@@ -102,10 +102,10 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 	}
 	format := strings.ToLower(opts.Format)
 	if format == "" {
-		format = "auto"
+		format = formatAuto
 	}
 	switch format {
-	case "auto", formatJSON, "html", "both":
+	case formatAuto, formatJSON, "html", "both":
 		// valid
 	default:
 		return nil, fmt.Errorf("fbmessenger: unknown --format %q (valid: auto, json, html, both)", format)
@@ -275,7 +275,7 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 				effective = "html"
 			case "both":
 				// Keep as-is; "both" threads get both parsed.
-			case "auto":
+			case formatAuto:
 				if effective == "both" {
 					effective = formatJSON
 				}
@@ -690,21 +690,56 @@ func writeThreadToStore(
 		}
 
 		// Attachments.
-		for _, att := range m.Attachments {
+		for ai := range m.Attachments {
+			att := m.Attachments[ai]
 			summary.AttachmentsFound++
 			storagePath, contentHash, size := handleAttachment(att, opts.AttachmentsDir)
 			if storagePath != "" {
 				summary.AttachmentsStored++
 			}
-			if storagePath != "" || contentHash != "" || att.AbsPath != "" {
-				if err := st.UpsertAttachment(messageID, att.Filename, att.MimeType, storagePath, contentHash, size); err != nil {
-					logger.Warn("fbmessenger: upsert attachment", "err", err)
+			syntheticHash := fbAttachmentHash(att, ai)
+			hash := contentHash
+			storedContent := storagePath != "" && contentHash != ""
+			existingContentHash := contentHash
+			if !storedContent && existingContentHash == "" {
+				existingContentHash = hashAttachmentSource(att)
+			}
+			if !storedContent && existingContentHash != "" {
+				stored, err := hasStoredAttachment(st, messageID, existingContentHash)
+				if err != nil {
+					logger.Warn("fbmessenger: check stored attachment", "err", err)
+				} else if stored {
+					if err := deleteLegacyHashlessAttachment(st, messageID); err != nil {
+						logger.Warn("fbmessenger: delete legacy hashless attachment", "err", err)
+					}
+					if err := deleteSyntheticPlaceholderAttachment(st, messageID, syntheticHash); err != nil {
+						logger.Warn("fbmessenger: delete synthetic attachment placeholder", "err", err)
+					}
+					continue
 				}
-			} else {
-				// Empty row so the user sees a trace that something was referenced.
-				if err := st.UpsertAttachment(messageID, att.Filename, att.MimeType, "", "", 0); err != nil {
-					logger.Warn("fbmessenger: upsert attachment (empty)", "err", err)
+			}
+			if !storedContent {
+				hash = syntheticHash
+			} else if err := deleteFailedStoredAttachment(st, messageID, contentHash); err != nil {
+				logger.Warn("fbmessenger: delete failed stored attachment", "err", err)
+			}
+			if err := st.UpsertAttachment(messageID, att.Filename, att.MimeType, storagePath, hash, size); err != nil {
+				logger.Warn("fbmessenger: upsert attachment", "err", err)
+				continue
+			}
+			if err := deleteLegacyHashlessAttachment(st, messageID); err != nil {
+				logger.Warn("fbmessenger: delete legacy hashless attachment", "err", err)
+			}
+			if storedContent {
+				if err := deleteSyntheticPlaceholderAttachment(st, messageID, syntheticHash); err != nil {
+					logger.Warn("fbmessenger: delete synthetic attachment placeholder", "err", err)
 				}
+			} else if contentHash != "" {
+				if err := deleteFailedStoredAttachment(st, messageID, contentHash); err != nil {
+					logger.Warn("fbmessenger: delete failed stored attachment", "err", err)
+				}
+			} else if err := deleteFailedStoredAttachmentByMetadata(st, messageID, att.Filename, att.MimeType); err != nil {
+				logger.Warn("fbmessenger: delete failed stored attachment", "err", err)
 			}
 		}
 
@@ -858,4 +893,110 @@ func handleAttachment(att Attachment, attachmentsDir string) (string, string, in
 		return "", contentHash, 0
 	}
 	return rel, contentHash, int(info.Size())
+}
+
+func hashAttachmentSource(att Attachment) string {
+	if att.AbsPath == "" {
+		return ""
+	}
+	linfo, err := os.Lstat(att.AbsPath)
+	if err != nil || !linfo.Mode().IsRegular() {
+		return ""
+	}
+	f, err := os.Open(att.AbsPath)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+const fbSyntheticAttachmentKeyPrefix = "fbmessenger:attachment:"
+
+func deleteLegacyHashlessAttachment(st *store.Store, messageID int64) error {
+	_, err := st.DB().Exec(st.Rebind(`
+		DELETE FROM attachments
+		WHERE message_id = ?
+		  AND (content_hash IS NULL OR content_hash = '')
+		  AND storage_path = ''
+	`), messageID)
+	return err
+}
+
+func deleteSyntheticPlaceholderAttachment(st *store.Store, messageID int64, contentHash string) error {
+	_, err := st.DB().Exec(st.Rebind(`
+		DELETE FROM attachments
+		WHERE message_id = ?
+		  AND content_hash = ?
+		  AND storage_path = ''
+	`), messageID, contentHash)
+	return err
+}
+
+func deleteFailedStoredAttachment(st *store.Store, messageID int64, contentHash string) error {
+	_, err := st.DB().Exec(st.Rebind(`
+		DELETE FROM attachments
+		WHERE message_id = ?
+		  AND content_hash = ?
+		  AND storage_path = ''
+	`), messageID, contentHash)
+	return err
+}
+
+func deleteFailedStoredAttachmentByMetadata(st *store.Store, messageID int64, filename, mimeType string) error {
+	_, err := st.DB().Exec(st.Rebind(`
+		DELETE FROM attachments
+		WHERE message_id = ?
+		  AND filename = ?
+		  AND mime_type = ?
+		  AND storage_path = ''
+		  AND content_hash <> ''
+		  AND LENGTH(content_hash) = 64
+	`), messageID, filename, mimeType)
+	return err
+}
+
+func hasStoredAttachment(st *store.Store, messageID int64, contentHash string) (bool, error) {
+	var stored bool
+	err := st.DB().QueryRow(st.Rebind(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM attachments
+			WHERE message_id = ?
+			  AND content_hash = ?
+			  AND storage_path <> ''
+		)
+	`), messageID, contentHash).Scan(&stored)
+	return stored, err
+}
+
+// fbAttachmentHash derives a stable synthetic attachment key for an attachment
+// that has no real (content-derived) hash — e.g. the file is missing or no
+// attachments dir was configured. Without it, UpsertAttachment collapses every
+// hashless attachment on a message to a single row. Keyed on the export-relative
+// URI (present even when the file is missing), then AbsPath/Filename, with the
+// loop index as a last-resort tiebreaker, so re-importing the same export is
+// idempotent. The prefix prevents downstream export paths from mistaking it for
+// a SHA-256 hash of stored bytes, so storage_path stays empty.
+func fbAttachmentHash(att Attachment, idx int) string {
+	key := att.URI
+	if key == "" {
+		key = att.AbsPath
+	}
+	if key == "" {
+		key = att.Filename
+	}
+	if key == "" {
+		key = fmt.Sprintf("idx-%d", idx)
+	}
+	sum := sha256.Sum256([]byte("fbmessenger\x00" + key))
+	return fbSyntheticAttachmentKeyPrefix + hex.EncodeToString(sum[:])
 }

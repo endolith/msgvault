@@ -22,7 +22,7 @@ func importFixture(t *testing.T, st *store.Store, rootDir string) *ImportSummary
 	opts := ImportOptions{
 		Me:             "test.user@facebook.messenger",
 		RootDir:        rootDir,
-		Format:         "auto",
+		Format:         formatAuto,
 		AttachmentsDir: t.TempDir(),
 	}
 	summary, err := ImportDYI(context.Background(), st, opts)
@@ -40,6 +40,12 @@ func countMessages(t *testing.T, st *store.Store, where string) int {
 	err := st.DB().QueryRow(q).Scan(&n)
 	requirepkg.NoError(t, err, "count query")
 	return n
+}
+
+func assertSyntheticAttachmentKey(t *testing.T, got string) {
+	t.Helper()
+	assertpkg.Regexp(t, `^fbmessenger:attachment:[0-9a-f]{64}$`, got, "synthetic attachment key")
+	assertpkg.NotRegexp(t, `^[0-9a-f]{64}$`, got, "synthetic attachment key must not look like a real SHA-256 content hash")
 }
 
 func TestImportDYI_JSONSimple(t *testing.T) {
@@ -233,7 +239,7 @@ func TestImportDYI_AttachmentStorage(t *testing.T) {
 	opts := ImportOptions{
 		Me:             "test.user@facebook.messenger",
 		RootDir:        "testdata/json_with_media",
-		Format:         "auto",
+		Format:         formatAuto,
 		AttachmentsDir: attachDir,
 	}
 	_, err := ImportDYI(context.Background(), st, opts)
@@ -258,6 +264,370 @@ func TestImportDYI_AttachmentStorage(t *testing.T) {
 	assert.Equal(int64(len(png)), size, "size")
 }
 
+func TestImportDYI_AttachmentStorageReimportMigratesLegacyEmptyHashRow(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	attachDir := t.TempDir()
+	opts := ImportOptions{
+		Me:       "test.user@facebook.messenger",
+		RootDir:  "testdata/json_with_media",
+		Format:   formatAuto,
+		NoResume: true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	_, err = st.DB().Exec(st.Rebind("DELETE FROM attachments WHERE message_id = ?"), messageID)
+	require.NoError(err, "delete current synthetic attachment")
+	require.NoError(st.UpsertAttachment(messageID, "tiny.png", "image/png", "", "", 0), "seed legacy empty-hash attachment")
+
+	opts.AttachmentsDir = attachDir
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "legacy empty-hash row should not survive beside stored attachment")
+
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+
+	var contentHash, storagePath string
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select stored attachment")
+	assert.Equal(wantHash, contentHash, "content_hash")
+	assert.NotEmpty(storagePath, "storage_path")
+	assert.Equal(int64(len(png)), size, "size")
+	got, err := os.ReadFile(filepath.Join(attachDir, storagePath))
+	require.NoError(err, "stored file")
+	assert.Equal(string(png), string(got), "stored bytes")
+}
+
+func TestImportDYI_AttachmentStorageReimportRemovesSyntheticPlaceholder(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	attachDir := t.TempDir()
+	opts := ImportOptions{
+		Me:       "test.user@facebook.messenger",
+		RootDir:  "testdata/json_with_media",
+		Format:   formatAuto,
+		NoResume: true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+
+	var placeholderHash, placeholderPath string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&placeholderHash, &placeholderPath)
+	require.NoError(err, "select synthetic placeholder")
+	assertSyntheticAttachmentKey(t, placeholderHash)
+	assert.Empty(placeholderPath, "synthetic placeholder storage_path")
+
+	opts.AttachmentsDir = attachDir
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "synthetic placeholder should not survive beside stored attachment")
+
+	var placeholderCount int
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT COUNT(*) FROM attachments WHERE message_id = ? AND content_hash = ?",
+	), messageID, placeholderHash).Scan(&placeholderCount)
+	require.NoError(err, "count synthetic placeholder")
+	assert.Equal(0, placeholderCount, "synthetic placeholder should be removed")
+
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+
+	var contentHash, storagePath string
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select stored attachment")
+	assert.Equal(wantHash, contentHash, "content_hash")
+	assert.NotEmpty(storagePath, "storage_path")
+	assert.Equal(int64(len(png)), size, "size")
+	got, err := os.ReadFile(filepath.Join(attachDir, storagePath))
+	require.NoError(err, "stored file")
+	assert.Equal(string(png), string(got), "stored bytes")
+}
+
+func TestImportDYI_AttachmentStorageFailureKeepsSyntheticPlaceholder(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	opts := ImportOptions{
+		Me:       "test.user@facebook.messenger",
+		RootDir:  "testdata/json_with_media",
+		Format:   formatAuto,
+		NoResume: true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+
+	var placeholderHash string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&placeholderHash)
+	require.NoError(err, "select synthetic placeholder")
+	assertSyntheticAttachmentKey(t, placeholderHash)
+
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+	require.NoError(st.UpsertAttachment(messageID, "tiny.png", "image/png", "", wantHash, 0), "seed stale real-hash empty-path attachment")
+
+	badAttachRoot := filepath.Join(t.TempDir(), "attachments-file")
+	require.NoError(os.WriteFile(badAttachRoot, []byte("not a directory"), 0600), "write bad attachment root")
+	opts.AttachmentsDir = badAttachRoot
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments after failed storage")
+	require.Equal(1, count, "failed storage should keep only the synthetic placeholder")
+
+	var contentHash, storagePath string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath)
+	require.NoError(err, "select placeholder after failed storage")
+	assert.Equal(placeholderHash, contentHash, "content_hash after failed storage")
+	assert.Empty(storagePath, "storage_path after failed storage")
+
+	var realHashRows int
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT COUNT(*) FROM attachments WHERE message_id = ? AND content_hash = ?",
+	), messageID, wantHash).Scan(&realHashRows)
+	require.NoError(err, "count real-hash rows after failed storage")
+	assert.Equal(0, realHashRows, "failed storage must not record a real hash with empty storage_path")
+
+	goodAttachRoot := t.TempDir()
+	opts.AttachmentsDir = goodAttachRoot
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments after successful storage")
+	require.Equal(1, count, "successful storage should replace the synthetic placeholder")
+
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select stored attachment after recovery")
+	assert.Equal(wantHash, contentHash, "content_hash after recovery")
+	assert.NotEmpty(storagePath, "storage_path after recovery")
+	assert.Equal(int64(len(png)), size, "size after recovery")
+	got, err := os.ReadFile(filepath.Join(goodAttachRoot, storagePath))
+	require.NoError(err, "stored file after recovery")
+	assert.Equal(string(png), string(got), "stored bytes after recovery")
+}
+
+func TestImportDYI_AttachmentStorageHashlessReimportRemovesStaleRealHashRow(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	opts := ImportOptions{
+		Me:       "test.user@facebook.messenger",
+		RootDir:  "testdata/json_with_media",
+		Format:   formatAuto,
+		NoResume: true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	var placeholderHash string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&placeholderHash)
+	require.NoError(err, "select synthetic placeholder")
+	assertSyntheticAttachmentKey(t, placeholderHash)
+
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+	require.NoError(st.UpsertAttachment(messageID, "tiny.png", "image/png", "", wantHash, 0), "seed stale real-hash empty-path attachment")
+
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "hashless reimport should keep only the synthetic placeholder")
+
+	var contentHash, storagePath string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath)
+	require.NoError(err, "select placeholder")
+	assert.Equal(placeholderHash, contentHash, "content_hash")
+	assert.Empty(storagePath, "storage_path")
+}
+
+func TestImportDYI_AttachmentStorageFailureDoesNotAddPlaceholderBesideStoredAttachment(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	attachDir := t.TempDir()
+	opts := ImportOptions{
+		Me:             "test.user@facebook.messenger",
+		RootDir:        "testdata/json_with_media",
+		Format:         formatAuto,
+		AttachmentsDir: attachDir,
+		NoResume:       true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+
+	badAttachRoot := filepath.Join(t.TempDir(), "attachments-file")
+	require.NoError(os.WriteFile(badAttachRoot, []byte("not a directory"), 0600), "write bad attachment root")
+	opts.AttachmentsDir = badAttachRoot
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "failed storage should not add a placeholder beside stored content")
+
+	var contentHash, storagePath string
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select stored attachment")
+	assert.Equal(wantHash, contentHash, "content_hash")
+	assert.NotEmpty(storagePath, "storage_path")
+	assert.Equal(int64(len(png)), size, "size")
+}
+
+func TestImportDYI_AttachmentStorageHashlessReimportDoesNotAddPlaceholderBesideStoredAttachment(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	attachDir := t.TempDir()
+	opts := ImportOptions{
+		Me:             "test.user@facebook.messenger",
+		RootDir:        "testdata/json_with_media",
+		Format:         formatAuto,
+		AttachmentsDir: attachDir,
+		NoResume:       true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+
+	opts.AttachmentsDir = ""
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "hashless reimport should not add a placeholder beside stored content")
+
+	var contentHash, storagePath string
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select stored attachment")
+	assert.Equal(wantHash, contentHash, "content_hash")
+	assert.NotEmpty(storagePath, "storage_path")
+	assert.Equal(int64(len(png)), size, "size")
+}
+
+func TestImportDYI_AttachmentStorageReimportRepairsRealHashEmptyPathRow(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	attachDir := t.TempDir()
+	opts := ImportOptions{
+		Me:       "test.user@facebook.messenger",
+		RootDir:  "testdata/json_with_media",
+		Format:   formatAuto,
+		NoResume: true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/bob_XYZ789__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	png, err := os.ReadFile("testdata/json_with_media/your_activity_across_facebook/messages/inbox/bob_XYZ789/photos/tiny.png")
+	require.NoError(err)
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(png))
+
+	_, err = st.DB().Exec(st.Rebind("DELETE FROM attachments WHERE message_id = ?"), messageID)
+	require.NoError(err, "delete current synthetic attachment")
+	require.NoError(st.UpsertAttachment(messageID, "tiny.png", "image/png", "", wantHash, 0), "seed real-hash empty-path attachment")
+
+	opts.AttachmentsDir = attachDir
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "real-hash empty-path row should be repaired, not duplicated")
+
+	var contentHash, storagePath string
+	var size int64
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT content_hash, storage_path, size FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&contentHash, &storagePath, &size)
+	require.NoError(err, "select repaired attachment")
+	assert.Equal(wantHash, contentHash, "content_hash")
+	assert.NotEmpty(storagePath, "storage_path")
+	assert.Equal(int64(len(png)), size, "size")
+	got, err := os.ReadFile(filepath.Join(attachDir, storagePath))
+	require.NoError(err, "stored file")
+	assert.Equal(string(png), string(got), "stored bytes")
+}
+
 func TestImportDYI_AttachmentPathEscapeRejected(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
@@ -278,12 +648,13 @@ func TestImportDYI_AttachmentPathEscapeRejected(t *testing.T) {
 	})
 	require.NoError(err)
 	assert.False(summary.HardErrors, "HardErrors")
-	// Exactly one attachment row, with empty storage_path and content_hash.
+	// Exactly one attachment row with empty storage_path and a synthetic
+	// key that cannot be mistaken for a real content hash.
 	var sp, ch string
 	err = st.DB().QueryRow("SELECT storage_path, content_hash FROM attachments LIMIT 1").Scan(&sp, &ch)
 	require.NoError(err)
 	assert.Empty(sp, "storage_path: path escape not rejected")
-	assert.Empty(ch, "content_hash: path escape not rejected")
+	assertSyntheticAttachmentKey(t, ch)
 }
 
 // TestImportDYI_AttachmentSymlinkRejected verifies that an attachment URI
@@ -327,7 +698,10 @@ func TestImportDYI_AttachmentSymlinkRejected(t *testing.T) {
 	err = st.DB().QueryRow("SELECT storage_path, content_hash FROM attachments LIMIT 1").Scan(&sp, &ch)
 	require.NoError(err)
 	assert.Empty(sp, "storage_path: symlinked attachment not rejected")
-	assert.Empty(ch, "content_hash: symlinked attachment not rejected")
+	assertSyntheticAttachmentKey(t, ch)
+	// The synthetic hash must never be the hash of the secret's contents.
+	leak := fmt.Sprintf("%x", sha256.Sum256([]byte("password=hunter2")))
+	assert.NotEqual(leak, ch, "content_hash must never be the secret's content hash")
 	// Defense in depth: assert nothing under attachmentsDir contains the
 	// secret bytes, so even a future copy regression would be caught.
 	_ = filepath.Walk(attachmentsDir, func(p string, info os.FileInfo, err error) error {
@@ -362,7 +736,95 @@ func TestImportDYI_MissingAttachment(t *testing.T) {
 	err = st.DB().QueryRow("SELECT storage_path, content_hash FROM attachments LIMIT 1").Scan(&sp, &ch)
 	require.NoError(err)
 	assert.Empty(sp, "storage_path: missing attachment should have empty storage_path")
-	assert.Empty(ch, "content_hash: missing attachment should have empty content_hash")
+	assertSyntheticAttachmentKey(t, ch)
+}
+
+func TestImportDYI_MissingAttachmentReimportMigratesLegacyEmptyHashRow(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	tmp := t.TempDir()
+	threadPath := filepath.Join(tmp, "your_activity_across_facebook", "messages", "inbox", "missing_MIS")
+	require.NoError(os.MkdirAll(threadPath, 0755))
+	body := `{"participants":[{"name":"A"},{"name":"B"}],"messages":[
+{"sender_name":"A","timestamp_ms":1600000000000,"type":"Generic","photos":[{"uri":"messages/inbox/missing_MIS/photos/gone.png"}]}
+],"title":"x"}`
+	require.NoError(os.WriteFile(filepath.Join(threadPath, "message_1.json"), []byte(body), 0644))
+	opts := ImportOptions{
+		Me:             "test.user@facebook.messenger",
+		RootDir:        tmp,
+		AttachmentsDir: t.TempDir(),
+		NoResume:       true,
+	}
+	_, err := ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var messageID int64
+	err = st.DB().QueryRow("SELECT id FROM messages WHERE source_message_id = 'inbox/missing_MIS__0'").Scan(&messageID)
+	require.NoError(err, "select imported message id")
+	_, err = st.DB().Exec(st.Rebind("DELETE FROM attachments WHERE message_id = ?"), messageID)
+	require.NoError(err, "delete current synthetic attachment")
+	require.NoError(st.UpsertAttachment(messageID, "gone.png", "", "", "", 0), "seed legacy empty-hash attachment")
+
+	_, err = ImportDYI(context.Background(), st, opts)
+	require.NoError(err)
+
+	var count int
+	err = st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM attachments WHERE message_id = ?"), messageID).Scan(&count)
+	require.NoError(err, "count attachments")
+	require.Equal(1, count, "legacy empty-hash row should not survive beside synthetic key")
+
+	var sp, ch string
+	err = st.DB().QueryRow(st.Rebind(
+		"SELECT storage_path, content_hash FROM attachments WHERE message_id = ?",
+	), messageID).Scan(&sp, &ch)
+	require.NoError(err, "select migrated attachment")
+	assert.Empty(sp, "storage_path")
+	assertSyntheticAttachmentKey(t, ch)
+}
+
+// TestImportDYI_MultipleMissingAttachments verifies that a single message
+// with multiple missing photos records one attachment row per photo, rather
+// than collapsing them to a single hashless row. Each row gets a stable,
+// distinct synthetic key that is not a real content hash while storage_path
+// stays empty (no bytes copied).
+func TestImportDYI_MultipleMissingAttachments(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := testutil.NewTestStore(t)
+	tmp := t.TempDir()
+	threadPath := filepath.Join(tmp, "your_activity_across_facebook", "messages", "inbox", "missing_MIS")
+	require.NoError(os.MkdirAll(threadPath, 0755))
+	body := `{"participants":[{"name":"A"},{"name":"B"}],"messages":[
+{"sender_name":"A","timestamp_ms":1600000000000,"type":"Generic","photos":[{"uri":"messages/inbox/missing_MIS/photos/a.png"},{"uri":"messages/inbox/missing_MIS/photos/b.png"}]}
+],"title":"x"}`
+	require.NoError(os.WriteFile(filepath.Join(threadPath, "message_1.json"), []byte(body), 0644))
+	summary, err := ImportDYI(context.Background(), st, ImportOptions{
+		Me:             "test.user@facebook.messenger",
+		RootDir:        tmp,
+		AttachmentsDir: t.TempDir(),
+	})
+	require.NoError(err)
+	assert.False(summary.HardErrors, "HardErrors")
+
+	var count int
+	require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM attachments").Scan(&count))
+	assert.Equal(2, count, "both missing attachments should be recorded as distinct rows")
+
+	rows, err := st.DB().Query("SELECT storage_path, content_hash FROM attachments ORDER BY id")
+	require.NoError(err)
+	defer func() { require.NoError(rows.Close(), "close attachment rows") }()
+	var hashes []string
+	for rows.Next() {
+		var sp, ch string
+		require.NoError(rows.Scan(&sp, &ch))
+		assert.Empty(sp, "storage_path: missing attachment should have empty storage_path")
+		assertSyntheticAttachmentKey(t, ch)
+		hashes = append(hashes, ch)
+	}
+	require.NoError(rows.Err())
+	require.Len(hashes, 2)
+	assert.NotEqual(hashes[0], hashes[1], "the two synthetic hashes must be distinct")
 }
 
 // TestImportDYI_ReactionsFirstClass verifies reaction rows and the
@@ -462,7 +924,7 @@ func TestImportDYI_IsFromMe(t *testing.T) {
 	_, err := ImportDYI(context.Background(), st, ImportOptions{
 		Me:             "test.user@facebook.messenger",
 		RootDir:        "testdata/json_simple",
-		Format:         "auto",
+		Format:         formatAuto,
 		AttachmentsDir: t.TempDir(),
 	})
 	require.NoError(err)
