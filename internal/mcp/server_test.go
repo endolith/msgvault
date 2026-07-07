@@ -70,19 +70,18 @@ type attachmentMeta struct {
 }
 
 type paginatedSearchMessages struct {
-	Data     []query.MessageSummary `json:"data"`
-	Total    int64                  `json:"total"`
-	Returned int                    `json:"returned"`
-	Offset   int                    `json:"offset"`
-	HasMore  bool                   `json:"has_more"`
+	Data     []searchMessageRow `json:"data"`
+	Total    int64              `json:"total"`
+	Returned int                `json:"returned"`
+	Offset   int                `json:"offset"`
+	HasMore  bool               `json:"has_more"`
 }
 
-type paginatedListMessages struct {
-	Data     []query.MessageSummary `json:"data"`
-	Total    int64                  `json:"total"`
-	Returned int                    `json:"returned"`
-	Offset   int                    `json:"offset"`
-	HasMore  bool                   `json:"has_more"`
+type searchMessageRow struct {
+	query.MessageSummary
+
+	Matches          []messageMatch `json:"matches"`
+	MatchesTruncated bool           `json:"matches_truncated"`
 }
 
 type getMessageResp struct {
@@ -96,6 +95,22 @@ type getMessageResp struct {
 	Offset         int    `json:"offset"`
 	HasMore        bool   `json:"has_more"`
 	ConversationID int64  `json:"conversation_id"`
+}
+
+type paginatedInMessageMatches struct {
+	Data     []messageMatch `json:"data"`
+	Total    int64          `json:"total"`
+	Returned int            `json:"returned"`
+	Offset   int            `json:"offset"`
+	HasMore  bool           `json:"has_more"`
+}
+
+type paginatedListMessages struct {
+	Data     []query.MessageSummary `json:"data"`
+	Total    int64                  `json:"total"`
+	Returned int                    `json:"returned"`
+	Offset   int                    `json:"offset"`
+	HasMore  bool                   `json:"has_more"`
 }
 
 // newTestHandlers creates a handlers instance with the given mock engine.
@@ -143,16 +158,23 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 func TestSearchMessages(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
-			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").Build(),
+			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").WithConversationID(99).Build(),
+		},
+		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
 
 	t.Run("valid query", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
 		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
-		require.Len(t, resp.Data, 1, "data")
-		assert.Equal(t, "Hello", resp.Data[0].Subject, "subject")
-		assert.Equal(t, "thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
+		require.Len(resp.Data, 1, "data")
+		assert.Equal("Hello", resp.Data[0].Subject, "subject")
+		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
+		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
+		assert.Equal(int64(1), resp.Total, "total")
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -167,32 +189,31 @@ func TestSearchMessages(t *testing.T) {
 	})
 }
 
-func TestSearchFallbackToFTS(t *testing.T) {
+// TestSearchMessages_MetadataOnly verifies that search_messages uses only the
+// fast metadata path and never calls the FTS body search engine.
+func TestSearchMessages_MetadataOnly(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
 	eng := &querytest.MockEngine{
-		SearchFastResults: nil, // fast returns nothing
-		SearchFunc: func(_ context.Context, _ *search.Query, limit, offset int) ([]query.MessageSummary, error) {
-			assert.Equal(2, limit, "FTS fallback should fetch one extra row for has_more")
-			assert.Equal(0, offset, "offset")
-			return []query.MessageSummary{
-				testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
-				testutil.NewMessageSummary(3).WithSubject("Second body match").Build(),
-			}, nil
+		SearchFastResults: []query.MessageSummary{
+			testutil.NewMessageSummary(3).WithSubject("Fast only").Build(),
+		},
+		// SearchResults would be returned by FTS body search — we set it to
+		// confirm search_messages never touches it.
+		SearchResults: []query.MessageSummary{
+			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
+		},
+		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
 
-	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{
-		"query": "important meeting notes",
-		"limit": float64(1),
-	})
-	require.Len(resp.Data, 1, "FTS fallback data")
-	assert.Equal(int64(2), resp.Data[0].ID, "FTS fallback ID")
-	assert.Equal(int64(totalCountUnknown), resp.Total, "FTS fallback total")
-	assert.Equal(1, resp.Returned, "returned")
-	assert.True(resp.HasMore, "has_more")
+	resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
+	require.Len(resp.Data, 1, "metadata-only results")
+	// Must return the fast result (ID 3), not the FTS result (ID 2).
+	assert.Equal(int64(3), resp.Data[0].ID, "metadata result ID")
 }
 
 func TestSearchMessages_NonPositiveLimitUsesDefault(t *testing.T) {
@@ -227,6 +248,132 @@ func TestSearchMessages_NonPositiveLimitUsesDefault(t *testing.T) {
 			assert.Equal(int64(1), resp.Total, "total")
 		})
 	}
+}
+
+func TestSearchMessageBodies(t *testing.T) {
+	eng := &querytest.MockEngine{
+		SearchResults: []query.MessageSummary{
+			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
+		},
+		Messages: map[int64]*query.MessageDetail{
+			2: testutil.NewMessageDetail(2).WithBodyText("The resistor value should be 5.1k ohms.").BuildPtr(),
+		},
+	}
+	h := newTestHandlers(eng)
+
+	t.Run("returns FTS results with matches", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		resp := runTool[paginatedSearchMessages](t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "5.1k ohms"})
+		require.Len(resp.Data, 1, "data")
+		assert.Equal(int64(2), resp.Data[0].ID)
+		require.NotEmpty(resp.Data[0].Matches, "matches")
+		assert.Contains(resp.Data[0].Matches[0].Snippet, "5.1k")
+		assert.Equal(int64(totalCountUnknown), resp.Total, "total=-1 for FTS")
+	})
+
+	t.Run("sets matches_truncated when excerpts exceed cap", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		var body strings.Builder
+		for range 7 {
+			body.WriteString("needle")
+			body.WriteString(strings.Repeat("x", 400))
+		}
+		eng := &querytest.MockEngine{
+			SearchResults: []query.MessageSummary{
+				testutil.NewMessageSummary(3).WithSubject("Many hits").Build(),
+			},
+			Messages: map[int64]*query.MessageDetail{
+				3: testutil.NewMessageDetail(3).WithBodyText(body.String()).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+		resp := runTool[paginatedSearchMessages](t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "needle"})
+		require.Len(resp.Data, 1)
+		assert.Len(resp.Data[0].Matches, maxContextSnippets)
+		assert.True(resp.Data[0].MatchesTruncated)
+	})
+
+	t.Run("requires free-text term", func(t *testing.T) {
+		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "from:alice"})
+		txt := resultText(t, r)
+		assert := assert.New(t)
+		assert.Contains(txt, "free-text term")
+		assert.Contains(txt, "metadata filters")
+	})
+
+	t.Run("missing query", func(t *testing.T) {
+		runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{})
+	})
+}
+
+func TestExtractContextChar(t *testing.T) {
+	t.Run("short body", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		body := "The resistor value should be 5.1k ohms not 10k as previously stated."
+		snippets := extractContextChar(body, []string{"5.1k"}, 200)
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.LessOrEqual(len(snippets[0]), 200)
+	})
+
+	t.Run("long quoted line", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		quoted := strings.Repeat("> This is quoted history that should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		snippets := extractContextChar(body, []string{"5.1k"}, 300)
+		require.Len(snippets, 1)
+		assert.Contains(snippets[0], "5.1k")
+		assert.Len(snippets[0], 300)
+		assert.NotContains(snippets[0], strings.Repeat("> This", 10))
+	})
+
+	t.Run("overlapping matches merge", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		body := "foo bar foo baz"
+		snippets := extractContextChar(body, []string{"foo"}, 20)
+		require.Len(snippets, 1)
+		assert.Equal(body, snippets[0])
+	})
+
+	t.Run("match near start", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		body := "needle" + strings.Repeat("x", 500)
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[:100], snippets[0])
+	})
+
+	t.Run("match near end", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		body := strings.Repeat("a", 500) + "needle"
+		snippets := extractContextChar(body, []string{"needle"}, 100)
+		require.Len(snippets, 1)
+		assert.Len(snippets[0], 100)
+		assert.Equal(body[len(body)-100:], snippets[0])
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		assert := assert.New(t)
+		assert.Nil(extractContextChar("hello world", []string{"zzz"}, 300))
+	})
+
+	t.Run("empty body", func(t *testing.T) {
+		assert := assert.New(t)
+		assert.Nil(extractContextChar("", []string{"foo"}, 300))
+	})
+
+	t.Run("short term skipped", func(t *testing.T) {
+		assert := assert.New(t)
+		assert.Nil(extractContextChar("abc", []string{"a"}, 300))
+	})
 }
 
 func TestSearchMessages_HybridModeNotConfigured(t *testing.T) {
@@ -757,6 +904,19 @@ func TestSearchMessages_UnknownMode(t *testing.T) {
 	assert.Contains(t, txt, "invalid mode", "expected 'invalid mode' error, got: %s")
 }
 
+// TestSearchMessages_FTSModeRejected guards that passing mode=fts to
+// search_messages returns an error directing the caller to search_message_bodies.
+func TestSearchMessages_FTSModeRejected(t *testing.T) {
+	h := newTestHandlers(&querytest.MockEngine{})
+
+	r := runToolExpectError(t, "search_messages", h.searchMessages, map[string]any{
+		"query": "meeting notes",
+		"mode":  searchModeFTS,
+	})
+	txt := resultText(t, r)
+	assert.Contains(t, txt, "invalid mode", "expected 'invalid mode' error, got: %s")
+}
+
 func TestGetMessage(t *testing.T) {
 	eng := &querytest.MockEngine{
 		Messages: map[int64]*query.MessageDetail{
@@ -879,6 +1039,7 @@ func TestGetMessage(t *testing.T) {
 	})
 
 	t.Run("center_at mid-body", func(t *testing.T) {
+		assert := assert.New(t)
 		body := strings.Repeat("a", 1000) + "KEYWORD" + strings.Repeat("z", 1000)
 		matchOffset := 1000
 		eng2 := &querytest.MockEngine{
@@ -892,9 +1053,10 @@ func TestGetMessage(t *testing.T) {
 			"center_at": float64(matchOffset),
 			"max_chars": float64(200),
 		})
-		assert.Contains(t, msg.BodyText, "KEYWORD")
-		assert.LessOrEqual(t, msg.Offset, matchOffset, "window starts before match")
-		assert.LessOrEqual(t, len(msg.BodyText), 200, "respects max_chars")
+		// The window should be centered on the match: KEYWORD must appear inside it.
+		assert.Contains(msg.BodyText, "KEYWORD")
+		assert.LessOrEqual(msg.Offset, matchOffset, "window starts before match")
+		assert.LessOrEqual(len(msg.BodyText), 200, "respects max_chars")
 	})
 
 	t.Run("center_at near start", func(t *testing.T) {
@@ -1084,6 +1246,30 @@ func TestGetStats_VectorEnabled(t *testing.T) {
 	assert.Equal(int64(100), ag.MessageCount, "active_generation.message_count")
 	assert.Equal(int64(3), resp.VectorSearch.MissingEmbeddingsTotal, "missing_embeddings_total")
 	assert.Nil(resp.VectorSearch.BuildingGeneration, "building_generation")
+}
+
+// toolPropertyDescription returns the description string for a tool input property.
+func toolPropertyDescription(t mcp.Tool, name string) string {
+	prop, ok := t.InputSchema.Properties[name].(map[string]any)
+	if !ok {
+		return ""
+	}
+	desc, _ := prop["description"].(string)
+	return desc
+}
+
+// TestAggregateTool_DocumentsTimeGranularity guards the group_by=time contract:
+// MCP always buckets by calendar year (the handler does not set TimeGranularity).
+func TestAggregateTool_DocumentsTimeGranularity(t *testing.T) {
+	tool := aggregateTool()
+	desc := tool.Description
+	groupByDesc := toolPropertyDescription(tool, "group_by")
+
+	assert := assert.New(t)
+	assert.Contains(desc, "calendar year", "tool description should document yearly time buckets")
+	assert.Contains(desc, "TotalUnique", "tool description should list response fields")
+	assert.Contains(groupByDesc, "calendar year", "group_by description should document yearly granularity")
+	assert.Contains(groupByDesc, `"2024"`, "group_by description should show example year key")
 }
 
 func TestAggregate(t *testing.T) {
@@ -1660,6 +1846,9 @@ func TestAccountFilter(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("search with valid account", func(t *testing.T) {
+		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
+		}
 		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{
 			"query":   "test",
 			"account": "alice@gmail.com",
@@ -1710,12 +1899,87 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("empty account means no filter", func(t *testing.T) {
 		// Empty string should not filter - return all results
+		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+			return 1, nil
+		}
 		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{
 			"query":   "test",
 			"account": "",
 		})
 		assert.Len(t, resp.Data, 1, "data")
 	})
+}
+
+func TestSearchInMessage(t *testing.T) {
+	t.Run("reports line and centered snippet", func(t *testing.T) {
+		body := "line one\nline two has the resistor value should be 5.1k ohms\nline three"
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				10: testutil.NewMessageDetail(10).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(10),
+			"query": "resistor",
+		})
+		require.Len(t, resp.Data, 1, "matches")
+		assert.Equal(t, 2, resp.Data[0].Line, "line")
+		assert.Contains(t, resp.Data[0].Snippet, "resistor")
+	})
+
+	t.Run("long quoted line", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		quoted := strings.Repeat("> quoted history should not bloat the snippet. ", 40)
+		body := "See below:\n" + quoted + "\nThe actual answer is 5.1k ohms."
+		eng := &querytest.MockEngine{
+			Messages: map[int64]*query.MessageDetail{
+				11: testutil.NewMessageDetail(11).WithBodyText(body).BuildPtr(),
+			},
+		}
+		h := newTestHandlers(eng)
+
+		resp := runTool[paginatedInMessageMatches](t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(11),
+			"query": "5.1k",
+		})
+		require.Len(resp.Data, 1, "matches")
+		assert.Contains(resp.Data[0].Snippet, "5.1k")
+		assert.LessOrEqual(len(resp.Data[0].Snippet), searchContextChars)
+		assert.NotContains(resp.Data[0].Snippet, strings.Repeat("> quoted", 5))
+	})
+
+	t.Run("nil message without error", func(t *testing.T) {
+		eng := &querytest.MockEngine{
+			GetMessageFunc: func(context.Context, int64) (*query.MessageDetail, error) {
+				return nil, nil //nolint:nilnil // mirrors Engine.GetMessage not-found contract
+			},
+		}
+		h := newTestHandlers(eng)
+		runToolExpectError(t, "search_in_message", h.searchInMessage, map[string]any{
+			"id":    float64(42),
+			"query": "resistor",
+		})
+	})
+}
+
+func TestListMessagesConversationID(t *testing.T) {
+	var captured query.MessageFilter
+	eng := &querytest.MockEngine{
+		ListMessagesFunc: func(_ context.Context, f query.MessageFilter) ([]query.MessageSummary, error) {
+			captured = f
+			return nil, nil
+		},
+	}
+	h := newTestHandlers(eng)
+
+	runTool[paginatedListMessages](t, "list_messages", h.listMessages, map[string]any{
+		"conversation_id": float64(42),
+	})
+	require.NotNil(t, captured.ConversationID, "conversation_id filter")
+	assert.Equal(t, int64(42), *captured.ConversationID, "conversation_id value")
 }
 
 // stageDeletionResponse matches the JSON response from stageDeletion.
@@ -1941,6 +2205,10 @@ type fakeBackend struct {
 	searchCalls  int
 	searchGen    vector.GenerationID
 	searchFilter vector.Filter
+	chunkHits    map[int64][]vector.ChunkHit
+	chunkErr     error
+	fusedHits    []vector.FusedHit
+	fusedErr     error
 	building     *vector.Generation
 	buildingErr  error
 	stats        map[vector.GenerationID]vector.Stats
@@ -1965,6 +2233,33 @@ func (f *fakeBackend) Search(_ context.Context, gen vector.GenerationID, _ []flo
 	f.searchGen = gen
 	f.searchFilter = filter
 	return f.searchHits, f.searchErr
+}
+func (f *fakeBackend) ScoreMessageChunks(_ context.Context, _ vector.GenerationID, messageID int64, _ []float32) ([]vector.ChunkHit, error) {
+	if f.chunkErr != nil {
+		return nil, f.chunkErr
+	}
+	if f.chunkHits != nil {
+		return f.chunkHits[messageID], nil
+	}
+	return nil, nil
+}
+func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+	if f.fusedErr != nil {
+		return nil, false, f.fusedErr
+	}
+	hits := f.fusedHits
+	if hits == nil {
+		hits = make([]vector.FusedHit, len(f.searchHits))
+		for i, h := range f.searchHits {
+			hits[i] = vector.FusedHit{
+				MessageID:   h.MessageID,
+				VectorScore: h.Score,
+				RRFScore:    h.Score,
+				BM25Score:   math.NaN(),
+			}
+		}
+	}
+	return hits, len(hits) >= req.Limit, nil
 }
 func (f *fakeBackend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, errors.New("not implemented")
@@ -1992,7 +2287,11 @@ func (f *fakeBackend) Stats(_ context.Context, gen vector.GenerationID) (vector.
 }
 func (f *fakeBackend) Close() error { return nil }
 
-var _ vector.Backend = (*fakeBackend)(nil)
+var (
+	_ vector.Backend             = (*fakeBackend)(nil)
+	_ vector.FusingBackend       = (*fakeBackend)(nil)
+	_ vector.ChunkScoringBackend = (*fakeBackend)(nil)
+)
 
 // similarResponse matches the JSON response shape of find_similar_messages.
 type similarResponse struct {
@@ -2111,8 +2410,78 @@ func TestSearchMessagesTool_AdvertisesVectorModesOnlyWhenAvailable(t *testing.T)
 }
 
 func TestFindSimilarMessagesTool_AdvertisesMessageTypeFilter(t *testing.T) {
+	assert := assert.New(t)
 	tool := findSimilarMessagesTool()
-	assert.Contains(t, tool.InputSchema.Properties, "message_type")
+	assert.Contains(tool.InputSchema.Properties, "message_type")
+}
+
+// TestSearchMessagesTool_DocumentsQuerySyntax guards the operator-support
+// contract so clients do not assume full Gmail compatibility.
+func TestSearchMessagesTool_DocumentsQuerySyntax(t *testing.T) {
+	assert := assert.New(t)
+	for _, vectorAvailable := range []bool{false, true} {
+		tool := searchMessagesTool(vectorAvailable)
+		desc := tool.Description
+		for _, want := range []string{
+			"cc:",
+			"bcc:",
+			"older_than:",
+			"Not supported: negation",
+			"subject, snippet",
+		} {
+			assert.Contains(desc, want, "vectorAvailable=%v: description missing %q", vectorAvailable, want)
+		}
+		assert.NotContains(desc, "Gmail-like", "vectorAvailable=%v: description should not over-promise Gmail compatibility", vectorAvailable)
+
+		queryDesc := toolPropertyDescription(tool, "query")
+		assert.Contains(queryDesc, "supported operators", "vectorAvailable=%v: query param should reference operator docs", vectorAvailable)
+	}
+}
+
+// TestSearchMessageBodiesTool_DocumentsQuerySyntax guards the query-syntax
+// contract so MCP clients know how body FTS interprets free-text terms.
+func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
+	assert := assert.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "ANDed", "tool description should document implicit AND, got: %q", tool.Description)
+	assert.Contains(tool.Description, "double-quoted phrase", "tool description should document phrase matching, got: %q", tool.Description)
+	assert.Contains(tool.Description, "OR and NOT are not supported", "tool description should document missing boolean ops, got: %q", tool.Description)
+
+	queryDesc := toolPropertyDescription(tool, "query")
+	assert.Contains(queryDesc, "ANDed", "query param should document implicit AND, got: %q", queryDesc)
+	assert.Contains(queryDesc, "double quotes", "query param should document phrase matching, got: %q", queryDesc)
+	assert.Contains(queryDesc, "OR/NOT unsupported", "query param should document missing boolean ops, got: %q", queryDesc)
+}
+
+// TestSearchMessageBodiesTool_DocumentsFilterVsFreeText guards the contract
+// that Gmail operators are metadata filters and unrecognized word:value
+// tokens are literal body text.
+func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
+	assert := assert.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "metadata filters", "tool description should distinguish filters from free text, got: %q", tool.Description)
+	assert.Contains(tool.Description, "Unrecognized word:value", "tool description should document literal colon tokens, got: %q", tool.Description)
+
+	queryDesc := toolPropertyDescription(tool, "query")
+	assert.Contains(queryDesc, "metadata filters", "query param should distinguish filters from free text, got: %q", queryDesc)
+	assert.Contains(queryDesc, "subject:test alone is rejected", "query param should warn subject: is not free text, got: %q", queryDesc)
+	assert.Contains(queryDesc, "Unrecognized word:value", "query param should document literal colon tokens, got: %q", queryDesc)
+}
+
+// TestSearchMessageBodiesTool_DocumentsMatchesTruncated guards the response-field
+// contract for when excerpt lists are capped.
+func TestSearchMessageBodiesTool_DocumentsMatchesTruncated(t *testing.T) {
+	assert := assert.New(t)
+	tool := searchMessageBodiesTool()
+
+	assert.Contains(tool.Description, "matches_truncated",
+		"tool description should document matches_truncated, got: %q", tool.Description)
+	assert.Contains(tool.Description, "search_in_message",
+		"tool description should point callers to search_in_message, got: %q", tool.Description)
+	assert.Contains(tool.Description, "get_message",
+		"tool description should point callers to get_message, got: %q", tool.Description)
 }
 
 func TestFindSimilarMessages_MissingID(t *testing.T) {

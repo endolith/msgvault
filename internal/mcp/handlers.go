@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,17 +29,21 @@ const (
 	maxLimit               = 1000
 	maxSearchMessagesLimit = 50
 	defaultSearchLimit     = 20
-	defaultBodyChars       = 2000
-	bodyFormatAuto         = "auto"
-	bodyFormatText         = "text"
-	bodyFormatHTML         = "html"
+	maxContextSnippets     = 5
+	// searchContextChars is the max byte length of each matches[] snippet in
+	// search_message_bodies and search_in_message.
+	searchContextChars = 300
+	defaultBodyChars   = 2000
+	bodyFormatAuto     = "auto"
+	bodyFormatText     = "text"
+	bodyFormatHTML     = "html"
 	// maxBodyChars caps the body slice returned by get_message regardless of what
 	// the caller requests via max_chars. Prevents a single tool call from flooding
 	// the context window; callers page forward using offset.
 	maxBodyChars = 4000
 	// totalCountUnknown is returned when the backend cannot report a full match
-	// count (body FTS fallback, hybrid/vector ranking depth, or list_messages
-	// without a separate count query). Clients should use has_more for paging.
+	// count (hybrid/vector ranking depth, or list_messages without a separate
+	// count query). Clients should use has_more for paging.
 	totalCountUnknown = -1
 )
 
@@ -308,6 +313,20 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 	return data, nil
 }
 
+// searchMessageItem carries a message summary plus body match excerpts.
+// Used by search_message_bodies.
+type searchMessageItem struct {
+	query.MessageSummary
+
+	// MatchesTruncated is true when more than maxContextSnippets (5) match
+	// excerpts were found; only the first 5 are returned.
+	Matches          []messageMatch `json:"matches,omitempty"`
+	MatchesTruncated bool           `json:"matches_truncated,omitempty"`
+}
+
+// searchMessages searches message metadata only (subject, sender, recipients,
+// labels, dates). Use search_message_bodies for full-body keyword search.
+// Vector and hybrid modes are delegated to searchMessagesHybrid.
 func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
@@ -317,25 +336,21 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	mode, _ := args["mode"].(string)
-	if mode == "" {
-		mode = searchModeFTS
-	}
 	explain, _ := args["explain"].(bool)
 
 	if mode == searchModeVector || mode == searchModeHybrid {
 		return h.searchMessagesHybrid(ctx, args, queryStr, mode, explain)
 	}
 
-	if mode != searchModeFTS {
+	if mode != "" {
 		return mcp.NewToolResultError(
-			fmt.Sprintf("invalid mode %q: must be %s, %s, or %s", mode, searchModeFTS, searchModeVector, searchModeHybrid),
+			fmt.Sprintf("invalid mode %q: must be %s or %s (or omit for metadata search)", mode, searchModeVector, searchModeHybrid),
 		), nil
 	}
 
 	limit := searchLimitArg(args)
 	offset := limitArg(args, "offset", 0)
 
-	// Look up account filter
 	account, _ := args["account"].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
@@ -352,23 +367,9 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 
 	filter := query.MessageFilter{SourceID: sourceID}
 
-	// Try fast search first (metadata only), fall back to full FTS.
 	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-	}
-
-	// If fast search returns nothing and query has free text, try full FTS.
-	if len(results) == 0 && len(q.TextTerms) > 0 {
-		results, err = h.engine.Search(ctx, q, limit+1, offset)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
-		}
-		hasMore := len(results) > limit
-		if hasMore {
-			results = results[:limit]
-		}
-		return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
 	}
 
 	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
@@ -401,6 +402,72 @@ func unsupportedSearchOperatorMessage(q *search.Query) string {
 	)
 }
 
+// searchMessageBodies performs full-text search over message bodies and returns
+// matches — short excerpts centered on each matched term. Requires at
+// least one free-text term; use search_messages for filter-only queries.
+func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	queryStr, _ := args["query"].(string)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := searchLimitArg(args)
+	offset := limitArg(args, "offset", 0)
+
+	account, _ := args["account"].(string)
+	sourceID, err := h.getAccountID(ctx, account)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	q := search.Parse(queryStr)
+	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
+		return mcp.NewToolResultError(msg), nil
+	}
+	if sourceID != nil {
+		q.AccountIDs = []int64{*sourceID}
+	}
+
+	if len(q.TextTerms) == 0 {
+		return mcp.NewToolResultError(
+			"search_message_bodies requires at least one free-text term (bare word or quoted phrase); " +
+				"Gmail operators such as from: or subject: are metadata filters and do not count — " +
+				"use search_messages for filter-only queries",
+		), nil
+	}
+
+	results, err := h.engine.Search(ctx, q, limit+1, offset)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	hasMore := len(results) > limit
+	if hasMore {
+		results = results[:limit]
+	}
+
+	data := make([]searchMessageItem, 0, len(results))
+	for _, r := range results {
+		item := searchMessageItem{MessageSummary: r}
+		msg, err := h.engine.GetMessage(ctx, r.ID)
+		if err == nil && msg != nil {
+			matches := extractContextMatches(msg.BodyText, q.TextTerms, searchContextChars)
+			if len(matches) > maxContextSnippets {
+				item.MatchesTruncated = true
+				matches = matches[:maxContextSnippets]
+			}
+			item.Matches = matches
+		}
+		data = append(data, item)
+	}
+
+	return jsonResult(newPaginatedResponseNoTotal(data, offset, hasMore))
+}
+
+// hybridScoreBreakdown exposes fused-score components for debugging.
+
 // hybridScoreBreakdown exposes fused-score components for debugging.
 // All score fields are pointer-typed so "not present in this signal"
 // can be distinguished from a legitimate 0.0 score. RRF is omitted in
@@ -414,11 +481,14 @@ type hybridScoreBreakdown struct {
 
 // hybridMessageItem is a single hit in a vector/hybrid response. The
 // embedded MessageSummary carries the standard message fields; Score is
-// present only when explain=true was requested.
+// present only when explain=true was requested. Matches lists the best
+// scoring embedded chunks for the query within this message.
 type hybridMessageItem struct {
 	query.MessageSummary
 
-	Score *hybridScoreBreakdown `json:"score,omitempty"`
+	Score            *hybridScoreBreakdown `json:"score,omitempty"`
+	Matches          []messageMatch        `json:"matches,omitempty"`
+	MatchesTruncated bool                  `json:"matches_truncated,omitempty"`
 }
 
 // HybridGeneration describes the active vector-index generation used to answer
@@ -446,7 +516,8 @@ type searchMessagesHybridResponse struct {
 // hybrid engine. Mirrors api/handlers.go handleHybridSearch: returns
 // descriptive errors when the engine is not configured or the index is
 // stale/building, otherwise returns RRF-ranked hits hydrated via
-// engine.GetMessage.
+// GetMessageSummariesByIDs (body omitted — use search_message_bodies or
+// search_in_message for body content).
 func (h *handlers) searchMessagesHybrid(
 	ctx context.Context, args map[string]any,
 	queryStr, mode string, explain bool,
@@ -478,11 +549,11 @@ func (h *handlers) searchMessagesHybrid(
 
 	// mode=vector|hybrid requires at least one free-text term; filter-only
 	// queries have no query vector to rank by. Callers that want pure
-	// structured filtering should use mode=fts instead.
+	// structured filtering should omit mode (metadata search).
 	if freeText == "" {
 		return mcp.NewToolResultError(
 			"missing_free_text: mode=" + mode +
-				" requires at least one free-text term; use mode=fts for filter-only queries",
+				" requires at least one free-text term; omit mode for metadata-only search",
 		), nil
 	}
 
@@ -508,7 +579,7 @@ func (h *handlers) searchMessagesHybrid(
 		if offset >= maxPage {
 			return mcp.NewToolResultError(fmt.Sprintf(
 				"pagination_limit: offset %d exceeds hybrid ranking window (max %d); "+
-					"use mode=fts for deeper pagination",
+					"use search_messages (metadata) or search_message_bodies for deeper pagination",
 				offset, maxPage,
 			)), nil
 		}
@@ -585,6 +656,10 @@ func (h *handlers) searchMessagesHybrid(
 		end := min(offset+limit, len(items))
 		page = items[offset:end]
 	}
+
+	minScore := floatArg(args, "min_score", 0)
+	h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore)
+
 	nextPageServable := maxPage == 0 || requestedEnd < maxPage
 	hasMore := false
 	if nextPageServable {
@@ -976,6 +1051,78 @@ func contextWindow(bodyLen, pos, termLen, contextChars int) (start, end int) {
 	return start, end
 }
 
+func lineNumberAt(body string, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 1
+	}
+	if byteOffset > len(body) {
+		byteOffset = len(body)
+	}
+	return 1 + strings.Count(body[:byteOffset], "\n")
+}
+
+// extractContextChar returns up to contextChars of body text centered on each
+// case-insensitive term match, merging overlapping windows.
+func extractContextChar(body string, terms []string, contextChars int) []string {
+	if body == "" || len(terms) == 0 || contextChars <= 0 {
+		return nil
+	}
+
+	lowerBody := strings.ToLower(body)
+
+	type span struct {
+		start, end int
+	}
+	var spans []span
+
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		lowerTerm := strings.ToLower(term)
+		termLen := len(term)
+		searchFrom := 0
+		for {
+			idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+			if idx < 0 {
+				break
+			}
+			pos := searchFrom + idx
+			searchFrom = pos + 1
+
+			start, end := contextWindow(len(body), pos, termLen, contextChars)
+			spans = append(spans, span{start: start, end: end})
+		}
+	}
+
+	if len(spans) == 0 {
+		return nil
+	}
+
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end < spans[j].end
+		}
+		return spans[i].start < spans[j].start
+	})
+
+	merged := []span{spans[0]}
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start <= last.end {
+			last.end = max(last.end, s.end)
+			continue
+		}
+		merged = append(merged, s)
+	}
+
+	out := make([]string, 0, len(merged))
+	for _, s := range merged {
+		out = append(out, bodyByteSlice(body, s.start, s.end))
+	}
+	return out
+}
+
 type getMessageResponse struct {
 	ID                   int64                  `json:"id"`
 	SourceMessageID      string                 `json:"source_message_id"`
@@ -1097,6 +1244,180 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		Labels:               msg.Labels,
 		Attachments:          msg.Attachments,
 	})
+}
+
+func (h *handlers) attachVectorChunkMatches(
+	ctx context.Context,
+	genID vector.GenerationID,
+	queryVec []float32,
+	items []hybridMessageItem,
+	minScore float64,
+) {
+	scorer, ok := h.backend.(vector.ChunkScoringBackend)
+	if !ok || len(queryVec) == 0 || len(items) == 0 {
+		return
+	}
+	for i := range items {
+		msg, err := h.engine.GetMessage(ctx, items[i].ID)
+		if err != nil || msg == nil {
+			continue
+		}
+		chunkHits, err := scorer.ScoreMessageChunks(ctx, genID, msg.ID, queryVec)
+		if err != nil {
+			continue
+		}
+		preprocessed := preprocessedEmbedText(msg.Subject, msg.BodyText, h.vectorCfg)
+		prefixRunes := subjectPrefixRuneCount(msg.Subject)
+		matches, truncated := chunkHitsToMatches(
+			preprocessed, msg.BodyText, prefixRunes,
+			chunkHits, minScore, maxContextSnippets,
+		)
+		items[i].Matches = matches
+		items[i].MatchesTruncated = truncated
+	}
+}
+
+func (h *handlers) vectorMatchesInMessage(
+	ctx context.Context,
+	messageID int64,
+	queryStr string,
+	minScore float64,
+	limit, offset int,
+) (*mcp.CallToolResult, error) {
+	if h.hybridEngine == nil || h.backend == nil {
+		return mcp.NewToolResultError(
+			"vector_not_enabled: vector search is not configured on this server",
+		), nil
+	}
+	scorer, ok := h.backend.(vector.ChunkScoringBackend)
+	if !ok {
+		return mcp.NewToolResultError(
+			"vector_not_enabled: chunk scoring is not available on this backend",
+		), nil
+	}
+
+	active, err := h.backend.ActiveGeneration(ctx)
+	if err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("active generation: %v", err)), nil
+	}
+	if _, err := vector.ResolveActiveForFingerprint(ctx, h.backend, h.vectorCfg.GenerationFingerprint()); err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("vector index: %v", err)), nil
+	}
+
+	queryVec, err := h.hybridEngine.EmbedQuery(ctx, queryStr)
+	if err != nil {
+		if r := translateVectorErr(err); r != nil {
+			return r, nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("embed query: %v", err)), nil
+	}
+
+	msg, err := h.engine.GetMessage(ctx, messageID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+
+	chunkHits, err := scorer.ScoreMessageChunks(ctx, active.ID, messageID, queryVec)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("score chunks: %v", err)), nil
+	}
+
+	preprocessed := preprocessedEmbedText(msg.Subject, msg.BodyText, h.vectorCfg)
+	prefixRunes := subjectPrefixRuneCount(msg.Subject)
+	allMatches, _ := chunkHitsToMatches(
+		preprocessed, msg.BodyText, prefixRunes,
+		chunkHits, minScore, len(chunkHits),
+	)
+
+	total := int64(len(allMatches))
+	if offset >= len(allMatches) {
+		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
+	}
+	end := min(offset+limit, len(allMatches))
+	page := allMatches[offset:end]
+	// Re-cap page length after pagination.
+	if len(page) > limit {
+		page = page[:limit]
+	}
+	return jsonResult(newPaginatedResponse(page, total, offset))
+}
+
+func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	id, err := getIDArg(args, "id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	queryStr, _ := args["query"].(string)
+	queryStr = strings.TrimSpace(queryStr)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	mode, _ := args["mode"].(string)
+	limit := limitArg(args, "limit", 10)
+	offset := limitArg(args, "offset", 0)
+
+	switch mode {
+	case "", "keyword":
+		// default: literal term search
+	case searchModeVector:
+		return h.vectorMatchesInMessage(ctx, id, queryStr, floatArg(args, "min_score", 0), limit, offset)
+	default:
+		return mcp.NewToolResultError(
+			fmt.Sprintf("invalid mode %q: must be keyword (default) or %s", mode, searchModeVector),
+		), nil
+	}
+
+	msg, err := h.engine.GetMessage(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+	}
+	if msg == nil {
+		return mcp.NewToolResultError("message not found"), nil
+	}
+
+	allMatches := findTermMatches(msg.BodyText, queryStr)
+	total := int64(len(allMatches))
+	if offset >= len(allMatches) {
+		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
+	}
+	end := min(offset+limit, len(allMatches))
+	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
+}
+
+func findTermMatches(body, term string) []messageMatch {
+	if body == "" || term == "" {
+		return nil
+	}
+	lowerBody := strings.ToLower(body)
+	lowerTerm := strings.ToLower(term)
+	termLen := len(term)
+	var matches []messageMatch
+	searchFrom := 0
+	for {
+		idx := strings.Index(lowerBody[searchFrom:], lowerTerm)
+		if idx < 0 {
+			break
+		}
+		pos := searchFrom + idx
+		searchFrom = pos + 1
+		start, end := contextWindow(len(body), pos, termLen, searchContextChars)
+		matches = append(matches, messageMatch{
+			CharOffset: pos,
+			Snippet:    bodyByteSlice(body, start, end),
+			Line:       lineNumberAt(body, pos),
+		})
+	}
+	return matches
 }
 
 const maxAttachmentSize = 50 * 1024 * 1024 // 50MB
@@ -1284,6 +1605,10 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 	if filter.Before, err = getDateArg(args, "before"); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if v, ok := args["conversation_id"].(float64); ok && v != 0 {
+		v2 := int64(v)
+		filter.ConversationID = &v2
+	}
 
 	results, err := h.engine.ListMessages(ctx, filter)
 	if err != nil {
@@ -1382,7 +1707,11 @@ func (h *handlers) aggregate(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	return jsonResult(rows)
 }
 
-// intArg extracts a non-negative integer from a map, with a default.
+// limitArg extracts a non-negative integer limit from a map, with a default.
+// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
+// result sets.
+// intArg extracts a non-negative integer from args without the maxLimit clamp
+// used by limitArg. Suitable for body-text offsets and similar unbounded values.
 func intArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -1394,9 +1723,6 @@ func intArg(args map[string]any, key string, def int) int {
 	return int(v)
 }
 
-// limitArg extracts a non-negative integer limit from a map, with a default.
-// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
-// result sets.
 func limitArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
