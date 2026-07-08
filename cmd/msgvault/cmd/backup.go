@@ -10,7 +10,8 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
-	"go.kenn.io/msgvault/internal/backup"
+	"go.kenn.io/kit/backup"
+	"go.kenn.io/msgvault/internal/backupapp"
 	"go.kenn.io/msgvault/internal/daemonclient"
 )
 
@@ -105,7 +106,7 @@ func runBackupInit(cmd *cobra.Command, _ []string) error {
 	}
 	r, err := backup.Init(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("initializing backup repository: %w", err)
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Initialized backup repository %s at %s\n",
 		r.Config().RepoID, r.Root()); err != nil {
@@ -121,11 +122,11 @@ func runBackupList(cmd *cobra.Command, _ []string) error {
 	}
 	r, err := backup.Open(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening backup repository: %w", err)
 	}
 	snapshots, err := r.ListSnapshots()
 	if err != nil {
-		return err
+		return fmt.Errorf("listing snapshots: %w", err)
 	}
 	return printBackupSnapshots(cmd.OutOrStdout(), snapshots)
 }
@@ -144,8 +145,12 @@ func printBackupSnapshots(w io.Writer, snapshots []*backup.Manifest) error {
 		if tag == "" {
 			tag = "-"
 		}
+		st, err := backupapp.ParseStats(m.Stats)
+		if err != nil {
+			return fmt.Errorf("snapshot %s: parsing manifest stats: %w", m.SnapshotID, err)
+		}
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			m.SnapshotID, m.CreatedAt, formatCount(m.Stats.Messages), formatSize(m.BytesAdded), tag)
+			m.SnapshotID, m.CreatedAt, formatCount(st.Messages), formatSize(m.BytesAdded), tag)
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("write backup list output: %w", err)
@@ -160,7 +165,7 @@ func runBackupVerify(cmd *cobra.Command, args []string) error {
 	}
 	r, err := backup.Open(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening backup repository: %w", err)
 	}
 	var snapshotID string
 	if len(args) > 0 {
@@ -174,7 +179,7 @@ func runBackupVerify(cmd *cobra.Command, args []string) error {
 	// An error mid-stage leaves the in-place TTY line open; close it so the
 	// error prints on its own row.
 	defer renderer.finish()
-	result, err := backup.Verify(cmd.Context(), r, backup.VerifyOptions{
+	result, err := backup.Verify(cmd.Context(), r, backupapp.New(Version), backup.VerifyOptions{
 		SnapshotID:  snapshotID,
 		All:         backupVerifyAll,
 		Quick:       backupVerifyQuick,
@@ -183,7 +188,7 @@ func runBackupVerify(cmd *cobra.Command, args []string) error {
 		Progress:    renderer.handle,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("verifying backup repository: %w", err)
 	}
 	for _, p := range result.Problems {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "problem: snapshot %s: %s\n", p.SnapshotID, p.Detail)
@@ -206,7 +211,7 @@ func runBackupRestore(cmd *cobra.Command, args []string) error {
 	}
 	r, err := backup.Open(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening backup repository: %w", err)
 	}
 	if err := refuseRestoreIntoLiveDaemonHome(backupRestoreTarget); err != nil {
 		return err
@@ -217,7 +222,7 @@ func runBackupRestore(cmd *cobra.Command, args []string) error {
 	}
 	renderer := newBackupProgressRenderer(cmd.OutOrStdout(), progressModeAuto)
 	defer renderer.finish()
-	res, err := backup.Restore(cmd.Context(), r, backup.RestoreOptions{
+	res, err := backup.Restore(cmd.Context(), r, backupapp.New(Version), backup.RestoreOptions{
 		SnapshotID:  snapshotID,
 		TargetDir:   backupRestoreTarget,
 		Overwrite:   backupRestoreOverwrite,
@@ -226,7 +231,7 @@ func runBackupRestore(cmd *cobra.Command, args []string) error {
 		Progress:    renderer.handle,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("restoring snapshot: %w", err)
 	}
 	out := cmd.OutOrStdout()
 	_, _ = fmt.Fprintf(out, "Restored snapshot %s to %s\n", res.SnapshotID, backupRestoreTarget)
@@ -310,6 +315,41 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 	return runBackupCreateLocal(cmd)
 }
 
+// backupExtrasSpec builds the msgvault extras selection for the generic
+// backup engine: the deletions directory always rides along; config.toml and
+// the tokens directory plus client-secret files are opt-in and marked
+// sensitive. The flag-named plaintext guard lives here so users see their
+// CLI flags in the error; the engine's own sensitive-source guard is the
+// backstop.
+func backupExtrasSpec() (backup.ExtrasSpec, error) {
+	if (backupCreateIncludeConfig || backupCreateIncludeTokens) && !backupCreateAllowPlaintextSecrets {
+		var flag string
+		switch {
+		case backupCreateIncludeConfig && backupCreateIncludeTokens:
+			flag = "--include-config/--include-tokens"
+		case backupCreateIncludeConfig:
+			flag = "--include-config"
+		default:
+			flag = "--include-tokens"
+		}
+		return backup.ExtrasSpec{}, fmt.Errorf(
+			"%s requires an encrypted repository (use --allow-plaintext-secrets to override)", flag)
+	}
+	spec := backup.ExtrasSpec{Dirs: []backup.ExtrasDirSpec{{Name: "deletions"}}}
+	if backupCreateIncludeConfig {
+		if cfgPath := cfg.ConfigFilePath(); cfgPath != "" {
+			spec.Files = append(spec.Files, backup.ExtrasFileSpec{
+				Path: cfgPath, RecordAs: "config.toml", Sensitive: true,
+			})
+		}
+	}
+	if backupCreateIncludeTokens {
+		spec.Dirs = append(spec.Dirs, backup.ExtrasDirSpec{Name: "tokens", Sensitive: true})
+		spec.Globs = append(spec.Globs, backup.ExtrasGlobSpec{Pattern: "client_secret*.json", Sensitive: true})
+	}
+	return spec, nil
+}
+
 func runBackupCreateLocal(cmd *cobra.Command) error {
 	repo, err := resolveBackupRepo(backupCreateRepo)
 	if err != nil {
@@ -321,7 +361,7 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 	}
 	r, err := backup.Open(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening backup repository: %w", err)
 	}
 
 	freezer, closeFreezer, err := newBackupFreezer()
@@ -342,25 +382,28 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 	renderer := newBackupProgressRenderer(cmd.OutOrStdout(), mode)
 	defer renderer.finish()
 
-	m, err := backup.Create(cmd.Context(), r, backup.CreateOptions{
+	extras, err := backupExtrasSpec()
+	if err != nil {
+		return err
+	}
+	m, err := backup.Create(cmd.Context(), r, backupapp.New(Version), backup.CreateOptions{
 		DBPath:                dbPath,
-		AttachmentsDir:        cfg.AttachmentsDir(),
+		ContentDir:            cfg.AttachmentsDir(),
 		DataDir:               cfg.Data.DataDir,
-		ConfigPath:            cfg.ConfigFilePath(),
+		Extras:                extras,
 		IncludeConfig:         backupCreateIncludeConfig,
 		IncludeTokens:         backupCreateIncludeTokens,
 		AllowPlaintextSecrets: backupCreateAllowPlaintextSecrets,
 		Tag:                   backupCreateTag,
 		ZstdLevel:             cfg.Backup.ZstdLevel,
 		CacheDir:              filepath.Join(cfg.HomeDir, "backup-cache"),
-		MsgvaultVersion:       Version,
 		Freezer:               freezer,
 		ForceUnlock:           backupCreateForceUnlock,
 		Jobs:                  backupCreateJobs,
 		Progress:              renderer.handle,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("creating backup snapshot: %w", err)
 	}
 
 	parent := m.ParentID
