@@ -184,18 +184,20 @@ func (s *Store) RemoveSource(sourceID int64) error {
 // closes the race where a sync starts between a pre-check and RemoveSource:
 // StartSync blocks on our exclusive lock, so either (a) it committed before
 // us and we observe the running row, or (b) it has not yet started and will
-// fail after we commit because the source is gone.
+// fail after we commit because the source is gone. Packed hashes that will
+// lose their last attachment reference are collected under the same lock so
+// their logical mappings can be deleted atomically with the source cascade.
 func (s *Store) RemoveSourceSerialized(
 	ctx context.Context, sourceID int64,
-) (hadActiveSync bool, err error) {
+) (hadActiveSync bool, packedMappingsRemoved int64, err error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return false, fmt.Errorf("acquire connection: %w", err)
+		return false, 0, fmt.Errorf("acquire connection: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	if err := s.dialect.BeginExclusive(ctx, conn); err != nil {
-		return false, fmt.Errorf("begin exclusive: %w", err)
+		return false, 0, fmt.Errorf("begin exclusive: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -208,15 +210,41 @@ func (s *Store) RemoveSourceSerialized(
 	if err := conn.QueryRowContext(ctx,
 		s.dialect.Rebind(`SELECT COUNT(*) FROM sync_runs WHERE status = 'running'`),
 	).Scan(&count); err != nil {
-		return false, fmt.Errorf("check active syncs: %w", err)
+		return false, 0, fmt.Errorf("check active syncs: %w", err)
 	}
 	hadActiveSync = count > 0
+
+	uniquePackedHashes, err := func() ([]string, error) {
+		rows, err := conn.QueryContext(ctx,
+			s.dialect.Rebind(packedBlobHashesUniqueToSourceSQL),
+			sourceID, sourceID, sourceID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list unique packed blobs: %w", err)
+		}
+		defer rows.Close() //nolint:errcheck // read-only cursor
+		var hashes []string
+		for rows.Next() {
+			var hash string
+			if err := rows.Scan(&hash); err != nil {
+				return nil, fmt.Errorf("scan unique packed blob: %w", err)
+			}
+			hashes = append(hashes, hash)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate unique packed blobs: %w", err)
+		}
+		return hashes, nil
+	}()
+	if err != nil {
+		return hadActiveSync, 0, err
+	}
 
 	if s.fts5Available {
 		if _, err := conn.ExecContext(
 			ctx, s.dialect.FTSDeleteSQL(), sourceID,
 		); err != nil {
-			return hadActiveSync, fmt.Errorf("delete FTS rows: %w", err)
+			return hadActiveSync, 0, fmt.Errorf("delete FTS rows: %w", err)
 		}
 	}
 
@@ -224,22 +252,67 @@ func (s *Store) RemoveSourceSerialized(
 		ctx, s.dialect.Rebind(`DELETE FROM sources WHERE id = ?`), sourceID,
 	)
 	if err != nil {
-		return hadActiveSync, fmt.Errorf("delete source: %w", err)
+		return hadActiveSync, 0, fmt.Errorf("delete source: %w", err)
 	}
-	rows, err := res.RowsAffected()
+	deletedSources, err := res.RowsAffected()
 	if err != nil {
-		return hadActiveSync, fmt.Errorf("check rows affected: %w", err)
+		return hadActiveSync, 0, fmt.Errorf("check rows affected: %w", err)
 	}
-	if rows == 0 {
-		return hadActiveSync, fmt.Errorf("source %d not found", sourceID)
+	if deletedSources == 0 {
+		return hadActiveSync, 0, fmt.Errorf("source %d not found", sourceID)
+	}
+
+	const deleteChunkSize = 500
+	for start := 0; start < len(uniquePackedHashes); start += deleteChunkSize {
+		end := min(start+deleteChunkSize, len(uniquePackedHashes))
+		chunk := uniquePackedHashes[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, len(chunk))
+		for i, hash := range chunk {
+			args[i] = hash
+		}
+		res, err := conn.ExecContext(ctx, s.dialect.Rebind(
+			`DELETE FROM attachment_pack_index WHERE blob_hash IN (`+placeholders+`)`), args...)
+		if err != nil {
+			return hadActiveSync, 0, fmt.Errorf("delete unique packed blob mappings: %w", err)
+		}
+		removed, err := res.RowsAffected()
+		if err != nil {
+			return hadActiveSync, 0, fmt.Errorf("count deleted packed blob mappings: %w", err)
+		}
+		packedMappingsRemoved += removed
 	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return hadActiveSync, fmt.Errorf("commit: %w", err)
+		return hadActiveSync, 0, fmt.Errorf("commit: %w", err)
 	}
 	committed = true
-	return hadActiveSync, nil
+	return hadActiveSync, packedMappingsRemoved, nil
 }
+
+const packedBlobHashesUniqueToSourceSQL = `
+	WITH source_blobs(blob_hash) AS (
+	    SELECT LOWER(a.content_hash) FROM attachments a
+	    WHERE a.content_hash IS NOT NULL AND a.content_hash != ''
+	      AND EXISTS (SELECT 1 FROM messages m
+	                  WHERE m.id = a.message_id AND m.source_id = ?)
+	    UNION
+	    SELECT LOWER(a.thumbnail_hash) FROM attachments a
+	    WHERE a.thumbnail_hash IS NOT NULL AND a.thumbnail_hash != ''
+	      AND EXISTS (SELECT 1 FROM messages m
+	                  WHERE m.id = a.message_id AND m.source_id = ?)
+	)
+	SELECT sb.blob_hash
+	FROM source_blobs sb
+	WHERE EXISTS (SELECT 1 FROM attachment_pack_index p
+	              WHERE p.blob_hash = sb.blob_hash)
+	  AND NOT EXISTS (
+	      SELECT 1 FROM attachments a2
+	      WHERE (LOWER(a2.content_hash) = sb.blob_hash OR LOWER(a2.thumbnail_hash) = sb.blob_hash)
+	        AND EXISTS (SELECT 1 FROM messages m2
+	                    WHERE m2.id = a2.message_id AND m2.source_id != ?)
+	  )
+	ORDER BY sb.blob_hash`
 
 // removeSourceExec performs the FTS + sources DELETE on a generic executor
 // (either a *loggedTx or *sql.Conn under a manual transaction).

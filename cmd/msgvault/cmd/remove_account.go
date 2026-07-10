@@ -37,6 +37,8 @@ and must be rebuilt. Run 'msgvault build-cache' afterward to rebuild it.
 
 Attachment files on disk that are not shared with another account are deleted.
 Shared attachments (same content hash across multiple accounts) are kept.
+Unique packed attachments become unreachable immediately; their immutable pack
+bytes are reclaimed by attachment maintenance.
 
 Examples:
   msgvault remove-account you@gmail.com
@@ -137,7 +139,6 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 				"Use --yes to force removal", email,
 		)
 	}
-
 	msgCount, err := s.CountMessagesForSource(source.ID)
 	if err != nil {
 		return fmt.Errorf("count messages: %w", err)
@@ -174,7 +175,7 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 	// so a sync started between our check and the delete is either seen
 	// as active (we skip file deletion) or fails after we commit because
 	// the source is gone.
-	hadActiveSync, err := s.RemoveSourceSerialized(cmd.Context(), source.ID)
+	hadActiveSync, packedMappingsRemoved, err := s.RemoveSourceSerialized(cmd.Context(), source.ID)
 	if err != nil {
 		return fmt.Errorf("remove account: %w", err)
 	}
@@ -280,6 +281,12 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		fmt.Printf(
 			"Preserved %d attachment file(s) shared with other accounts.\n",
 			preservedFiles,
+		)
+	}
+	if packedMappingsRemoved > 0 {
+		fmt.Printf(
+			"Removed %d packed blob mapping(s); physical pack bytes will be reclaimed by repack.\n",
+			packedMappingsRemoved,
 		)
 	}
 	fmt.Println(

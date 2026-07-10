@@ -831,6 +831,46 @@ func (s *Store) InitSchema() error {
 		}
 	}
 
+	// Indexes over attachment thumbnail hash/path serve pack enumeration and
+	// remove-account's per-candidate reference checks. The LOWER(hash)
+	// expression indexes serve alias-aware pack reads, pruning, and repack
+	// liveness without scanning the full attachments table for every packed
+	// entry. PostgreSQL only here:
+	// schema_pg.sql executes before any maintenance hatch is available, and on
+	// an existing large archive the one-time builds can exceed the pool-wide
+	// 30s statement_timeout, so they run under runMaintenance (finding S1) like
+	// the other one-time index builds above. SQLite keeps both in schema.sql —
+	// it has no statement_timeout. IF NOT EXISTS is idempotent per start.
+	if s.IsPostgreSQL() {
+		if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+			if _, err := tx.ExecContext(ctx, `
+				CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash
+				    ON attachments(thumbnail_hash)
+			`); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_path
+				    ON attachments(thumbnail_path)
+			`); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				CREATE INDEX IF NOT EXISTS idx_attachments_content_hash_lower
+				    ON attachments(LOWER(content_hash))
+			`); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `
+				CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash_lower
+				    ON attachments(LOWER(thumbnail_hash))
+			`)
+			return err
+		}); err != nil {
+			return fmt.Errorf("create attachment lookup indexes: %w", err)
+		}
+	}
+
 	// Backfill last_modified for rows that predate the column. SQLite cannot
 	// ADD COLUMN with a non-constant default, so the legacy ADD COLUMN above
 	// leaves existing rows NULL; this one-shot UPDATE sets them to

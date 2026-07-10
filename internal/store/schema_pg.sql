@@ -364,6 +364,33 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
     applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Packed attachment storage (docs/internal/packed-attachments-design.md).
+-- attachment_pack_index maps content-addressed blobs (attachment content and
+-- thumbnails) to sealed pack files under attachments/packs/. Rows exist only
+-- for live packed blobs; loose files have no row. pack_offset et al mirror
+-- the pack footer's entry so reads need no footer parse ("offset" is a
+-- reserved word in SQLite and PostgreSQL, hence the prefix).
+CREATE TABLE IF NOT EXISTS attachment_pack_index (
+    blob_hash   TEXT PRIMARY KEY,
+    pack_id     TEXT NOT NULL,
+    pack_offset BIGINT NOT NULL,
+    stored_len  BIGINT NOT NULL,
+    raw_len     BIGINT NOT NULL,
+    flags       INTEGER NOT NULL,
+    crc32c      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachment_pack_index_pack
+    ON attachment_pack_index(pack_id);
+
+-- Immutable per-pack totals captured at seal/adoption. GC derives dead bytes
+-- as stored_bytes minus the sum of the pack's live index rows.
+CREATE TABLE IF NOT EXISTS attachment_packs (
+    pack_id      TEXT PRIMARY KEY,
+    entry_count  BIGINT NOT NULL,
+    stored_bytes BIGINT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
 -- ============================================================================
 -- INDEXES
 -- ============================================================================
@@ -406,6 +433,12 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
+-- Thumbnail hash/path and LOWER(content_hash)/LOWER(thumbnail_hash) indexes
+-- are created in Go (Store.InitSchema) under the maintenance escape hatch:
+-- this file executes before that hatch is available, and the one-time index
+-- builds over a populated attachments table can exceed the pool-wide 30s
+-- statement_timeout on a large archive (finding S1). SQLite keeps the indexes
+-- in schema.sql (no statement_timeout there).
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
 -- idx_attachments_msg_content_hash is created in Go (Store.InitSchema)
 -- after a one-shot dedupe of legacy duplicate rows.

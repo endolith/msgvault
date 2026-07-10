@@ -506,6 +506,364 @@ func TestStoreAPIAdapterServesSourceStatus(t *testing.T) {
 	assert.Equal("history-2", *got.LastSuccessfulSync.CursorAfter, "LastSuccessfulSync.CursorAfter")
 }
 
+func TestStoreAPIAdapterRunCLISyncPacksOnlyAfterSubprocessSuccess(t *testing.T) {
+	tests := []struct {
+		name           string
+		predecessorErr error
+		wantPacked     bool
+		wantAttempts   int
+	}{
+		{name: "success", wantPacked: true, wantAttempts: 1},
+		{name: "failure", predecessorErr: errors.New("sync subprocess failed")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newAttachmentMaintenanceFixture(t)
+			hash := f.addLoose([]byte("CLI sync attachment payload"))
+			adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+			var events []api.CLISyncEvent
+			runnerCalls := 0
+
+			err := adapter.runCLISyncWithRunner(
+				context.Background(),
+				api.CLISyncRequest{Email: "alice@example.com"},
+				func(event api.CLISyncEvent) error {
+					events = append(events, event)
+					return nil
+				},
+				func(_ context.Context, args []string, _ func(string, string) error) error {
+					runnerCalls++
+					assert.Equal([]string{"sync", "alice@example.com"}, args)
+					assert.Nil(f.packedEntry(hash), "packing must follow subprocess success")
+					return tt.predecessorErr
+				},
+			)
+
+			if tt.predecessorErr != nil {
+				require.ErrorIs(err, tt.predecessorErr)
+			} else {
+				require.NoError(err)
+			}
+			assert.Equal(1, runnerCalls)
+			assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
+			assert.Equal(tt.wantAttempts,
+				strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
+			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
+		})
+	}
+}
+
+func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		predecessorErr error
+		wantPacked     bool
+		wantAttempts   int
+	}{
+		{
+			name:         "allowlisted success",
+			args:         []string{importMboxCommand, "archive.mbox"},
+			wantPacked:   true,
+			wantAttempts: 1,
+		},
+		{
+			name: "unrelated success",
+			args: []string{"remove-account", "alice@example.com"},
+		},
+		{
+			name:           "allowlisted failure",
+			args:           []string{"sync-teams", "alice@example.com"},
+			predecessorErr: errors.New("command subprocess failed"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newAttachmentMaintenanceFixture(t)
+			hash := f.addLoose([]byte("generic CLI attachment payload"))
+			adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+			var events []api.CLIRunEvent
+			runnerCalls := 0
+
+			err := adapter.runCLICommandWithRunner(
+				context.Background(),
+				api.CLIRunRequest{Args: tt.args, Env: map[string]string{"TEST": "value"}, Cwd: "/tmp"},
+				func(event api.CLIRunEvent) error {
+					events = append(events, event)
+					return nil
+				},
+				func(
+					_ context.Context,
+					args []string,
+					env map[string]string,
+					cwd string,
+					_ func(string, string) error,
+				) error {
+					runnerCalls++
+					assert.Equal(tt.args, args)
+					assert.Equal(map[string]string{"TEST": "value"}, env)
+					assert.Equal("/tmp", cwd)
+					assert.Nil(f.packedEntry(hash), "packing must follow subprocess success")
+					return tt.predecessorErr
+				},
+			)
+
+			if tt.predecessorErr != nil {
+				require.ErrorIs(err, tt.predecessorErr)
+			} else {
+				require.NoError(err)
+			}
+			assert.Equal(1, runnerCalls)
+			assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
+			assert.Equal(tt.wantAttempts,
+				strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
+			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
+		})
+	}
+}
+
+func TestStoreAPIAdapterInterceptsExplicitRepackInDaemonParent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	oldPackID := f.makeZeroLivePack([]byte("explicit parent repack dead bytes"))
+	adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+	var events []api.CLIRunEvent
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(), api.CLIRunRequest{Args: []string{"repack-attachments"}},
+		func(event api.CLIRunEvent) error {
+			events = append(events, event)
+			return nil
+		},
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			require.FailNow("explicit repack must never spawn a child process")
+			return nil
+		},
+	)
+
+	require.NoError(err)
+	has, err := f.store.HasPackRecord(oldPackID)
+	require.NoError(err)
+	assert.False(has)
+	require.Len(events, 1)
+	assert.Equal("stdout", events[0].Type)
+	assert.Contains(events[0].Data, "removed 1 old pack(s)")
+}
+
+func TestStoreAPIAdapterExplicitRepackAcceptsLoggingPassthroughFlags(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	oldPackID := f.makeZeroLivePack([]byte("explicit repack with root logging flags"))
+	adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(), api.CLIRunRequest{Args: []string{
+			"repack-attachments", "--log-level=debug", "--log-sql",
+			"--log-sql-slow-ms=250", "--verbose",
+		}}, nil,
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			require.FailNow("explicit repack with root flags must still run in the daemon parent")
+			return nil
+		},
+	)
+
+	require.NoError(err)
+	has, err := f.store.HasPackRecord(oldPackID)
+	require.NoError(err)
+	assert.False(has)
+}
+
+func TestRepackAttachmentsParentArgsAllowed(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "none", want: true},
+		{name: "forwarded logging", args: []string{
+			"--log-level=debug", "--log-sql", "--log-sql-slow-ms=250", "--verbose",
+		}, want: true},
+		{name: "non-forwarded root flag", args: []string{"--config=/tmp/config.toml"}},
+		{name: "command-specific flag", args: []string{"--target-size=1024"}},
+		{name: "positional argument", args: []string{"unexpected"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, repackAttachmentsParentArgsAllowed(tt.args))
+		})
+	}
+}
+
+func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
+	tests := []struct {
+		name           string
+		predecessorErr error
+		wantRemoved    bool
+	}{
+		{name: "successful removal", wantRemoved: true},
+		{name: "failed removal", predecessorErr: errors.New("remove failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newAttachmentMaintenanceFixture(t)
+			oldPackID := f.makeZeroLivePack([]byte("post removal dead bytes"))
+			adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+			runnerCalls := 0
+
+			err := adapter.runCLICommandWithRunner(
+				context.Background(),
+				api.CLIRunRequest{Args: []string{"remove-account", "alice@example.com", "--yes"}},
+				nil,
+				func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+					runnerCalls++
+					return tt.predecessorErr
+				},
+			)
+			if tt.predecessorErr != nil {
+				require.ErrorIs(err, tt.predecessorErr)
+			} else {
+				require.NoError(err)
+			}
+			assert.Equal(1, runnerCalls)
+			has, hasErr := f.store.HasPackRecord(oldPackID)
+			require.NoError(hasErr)
+			assert.Equal(!tt.wantRemoved, has)
+		})
+	}
+}
+
+func TestStoreAPIAdapterPostRemovalRepackWarningPreservesSuccess(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	maintenance, _ := newFailingAttachmentMaintenance(t)
+	adapter := &storeAPIAdapter{store: maintenance.store, attachmentMaintenance: maintenance}
+	var events []api.CLIRunEvent
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(), api.CLIRunRequest{Args: []string{"remove-account", "alice@example.com", "--yes"}},
+		func(event api.CLIRunEvent) error {
+			events = append(events, event)
+			return nil
+		},
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			return nil
+		},
+	)
+
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("stderr", events[0].Type)
+	assert.Contains(events[0].Data, "repack-attachments")
+}
+
+func TestStoreAPIAdapterPostRemovalRepackCancellationPreservesSuccess(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	oldPackID := f.makeZeroLivePack([]byte("canceled post-removal repack remains retryable"))
+	adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+	ctx, cancel := context.WithCancel(context.Background())
+	var events []api.CLIRunEvent
+
+	err := adapter.runCLICommandWithRunner(
+		ctx, api.CLIRunRequest{Args: []string{"remove-account", "alice@example.com", "--yes"}},
+		func(event api.CLIRunEvent) error {
+			events = append(events, event)
+			return nil
+		},
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			cancel()
+			return nil
+		},
+	)
+
+	require.NoError(err, "maintenance cancellation cannot erase committed removal success")
+	assert.Empty(events, "cancellation is informational, not a streamed warning")
+	has, err := f.store.HasPackRecord(oldPackID)
+	require.NoError(err)
+	assert.True(has, "canceled cleanup remains inventoried for retry")
+	assert.Contains(f.logs.String(), "automatic attachment repack canceled")
+}
+
+func TestStoreAPIAdapterExplicitRepackCancellationFailsFast(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	oldPackID := f.makeZeroLivePack([]byte("explicit canceled repack is fail-fast"))
+	adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := adapter.runCLICommandWithRunner(
+		ctx, api.CLIRunRequest{Args: []string{"repack-attachments"}}, nil,
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			require.FailNow("explicit repack must never spawn a child process")
+			return nil
+		},
+	)
+
+	require.ErrorIs(err, context.Canceled)
+	has, getErr := f.store.HasPackRecord(oldPackID)
+	require.NoError(getErr)
+	assert.True(has, "fail-fast cancellation leaves physical inventory untouched")
+}
+
+func TestStoreAPIAdapterMaintenanceWarningStreamsWithoutChangingSuccess(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	maintenance, logs := newFailingAttachmentMaintenance(t)
+	adapter := &storeAPIAdapter{store: maintenance.store, attachmentMaintenance: maintenance}
+	var events []api.CLISyncEvent
+
+	err := adapter.runCLISyncWithRunner(
+		context.Background(),
+		api.CLISyncRequest{Email: "alice@example.com"},
+		func(event api.CLISyncEvent) error {
+			events = append(events, event)
+			return nil
+		},
+		func(context.Context, []string, func(string, string) error) error { return nil },
+	)
+
+	require.NoError(err, "automatic maintenance failure must preserve sync success")
+	require.Len(events, 1, "one concise warning event")
+	assert.Equal("stderr", events[0].Type)
+	assert.Contains(events[0].Data, "pack-attachments")
+	assert.Contains(events[0].Data, "retry")
+	assert.Contains(logs.String(), "automatic attachment maintenance failed")
+}
+
+func TestStoreAPIAdapterMaintenanceWarningStreamFailurePreservesSuccess(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	maintenance, logs := newFailingAttachmentMaintenance(t)
+	adapter := &storeAPIAdapter{store: maintenance.store, attachmentMaintenance: maintenance}
+	warningErr := errors.New("client disconnected")
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(),
+		api.CLIRunRequest{Args: []string{importMboxCommand, "archive.mbox"}},
+		func(api.CLIRunEvent) error { return warningErr },
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			return nil
+		},
+	)
+
+	require.NoError(err, "warning stream failure must preserve command success")
+	assert.Contains(logs.String(), "failed to emit automatic attachment maintenance warning")
+	assert.Contains(logs.String(), warningErr.Error())
+}
+
 func TestStoreAPIAdapterServesCLIInitDB(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)

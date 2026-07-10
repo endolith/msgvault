@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,8 +85,6 @@ func (c *attachmentCorpus) attachmentRowCount() int {
 // attachmentRowsForHash counts attachment rows carrying the given content
 // hash. The hash argument is always hashShared in the current suite but
 // kept explicit so each call site reads as a content-hash assertion.
-//
-//nolint:unparam // hash intentionally parameterized; see doc comment.
 func (c *attachmentCorpus) attachmentRowsForHash(hash string) int {
 	c.t.Helper()
 	var n int
@@ -97,13 +96,11 @@ func (c *attachmentCorpus) attachmentRowsForHash(hash string) int {
 	return n
 }
 
-// hashes used throughout the suite. Real values are 64-char hex; the values
-// here are fixed sentinels that round-trip cleanly through the DB and the
-// content_hash column has no parsing constraints inside the store layer.
-const (
-	hashShared = "h1sharedhash0000000000000000000000000000000000000000000000000abc"
-	hashUniqA  = "h2uniqueA00000000000000000000000000000000000000000000000000000de"
-	hashUniqB  = "h3uniqueB000000000000000000000000000000000000000000000000000ab12"
+// Deterministic SHA-256-shaped sentinels used throughout the suite.
+var (
+	hashShared = packTestHash("a1ab")
+	hashUniqA  = packTestHash("a2cd")
+	hashUniqB  = packTestHash("a3ef")
 )
 
 func TestGetMessageIncludesAttachmentWithNullableMetadata(t *testing.T) {
@@ -232,6 +229,18 @@ func TestAttachment_E2E_CrossSourceDedupPromotion(t *testing.T) {
 	c.addAttachment("msg-a2", "unique-a.pdf", hashUniqA)
 	c.addAttachment("msg-b1", "shared.pdf", hashShared)
 	c.addAttachment("msg-b2", "unique-b.pdf", hashUniqB)
+	const packID = "01hzy3v7q8r9s0t1a2v3w4x5p1"
+	rec := store.PackRecord{
+		PackID:      packID,
+		EntryCount:  3,
+		StoredBytes: 300,
+		CreatedAt:   time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}
+	require.NoError(c.store.RecordPackedBlobs(rec, []store.PackIndexEntry{
+		{BlobHash: hashShared, PackID: packID, StoredLen: 100, RawLen: 100},
+		{BlobHash: hashUniqA, PackID: packID, Offset: 100, StoredLen: 100, RawLen: 100},
+		{BlobHash: hashUniqB, PackID: packID, Offset: 200, StoredLen: 100, RawLen: 100},
+	}))
 
 	// Before removing B: A's unique-set is just hashUniqA.
 	pathsA, err := c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
@@ -249,9 +258,17 @@ func TestAttachment_E2E_CrossSourceDedupPromotion(t *testing.T) {
 		assert.Equal(wantB, pathsB[0], "pathsB[0] before A removal")
 	}
 
-	// Remove source B. The shared hash is now unique to A.
-	err = c.store.RemoveSource(c.srcB.ID)
-	require.NoError(err, "RemoveSource(B)")
+	// Remove source B transactionally. Its unique mapping is deleted while
+	// the cross-source shared mapping remains live for A.
+	_, packedB, err := c.store.RemoveSourceSerialized(context.Background(), c.srcB.ID)
+	require.NoError(err, "RemoveSourceSerialized(B)")
+	assert.Equal(int64(1), packedB, "only B's unique packed mapping is removed")
+	entry, err := c.store.GetAttachmentPackEntry(hashShared)
+	require.NoError(err)
+	assert.NotNil(entry, "shared packed mapping remains live for A")
+	entry, err = c.store.GetAttachmentPackEntry(hashUniqB)
+	require.NoError(err)
+	assert.Nil(entry, "B's unique packed mapping is logically deleted")
 
 	pathsA, err = c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
 	require.NoError(err, "AttachmentPathsUniqueToSource(A) after B removal")
@@ -260,6 +277,10 @@ func TestAttachment_E2E_CrossSourceDedupPromotion(t *testing.T) {
 		assert.Truef(got[want], "paths missing %q after B removal; got %v", want, pathsA)
 	}
 	assert.Len(pathsA, 2, "pathsA len after B removal; got %v", pathsA)
+	_, packedA, err := c.store.RemoveSourceSerialized(context.Background(), c.srcA.ID)
+	require.NoError(err, "RemoveSourceSerialized(A)")
+	assert.Equal(int64(2), packedA,
+		"shared packed blob becomes unique and is deleted with A's original unique blob")
 }
 
 // TestAttachment_E2E_RemoveSourceCascadesAttachmentRows verifies that
@@ -321,9 +342,10 @@ func TestAttachment_E2E_OrphanCleanupLifecycle(t *testing.T) {
 	}
 
 	// Pipeline step 2: cascade-delete source A.
-	hadActive, err := c.store.RemoveSourceSerialized(context.Background(), c.srcA.ID)
+	hadActive, packedRemoved, err := c.store.RemoveSourceSerialized(context.Background(), c.srcA.ID)
 	require.NoError(err, "RemoveSourceSerialized(A)")
 	assert.False(hadActive, "hadActiveSync want false (no sync running in fixture)")
+	assert.Zero(packedRemoved, "fixture has no packed mappings")
 
 	// Pipeline step 3: per-candidate reference recheck. The candidate path
 	// for A is now unreferenced (msg-a2 row is gone); the shared path is

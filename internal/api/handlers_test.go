@@ -23,6 +23,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/kit/pack"
+	"go.kenn.io/msgvault/internal/blobstore"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
@@ -1285,6 +1287,9 @@ func TestHandleCLIRunBackupSubcommandAdmission(t *testing.T) {
 		{"backup unknown subcommand rejected", []string{"backup", "restore"}, false},
 		{"logs still allowed", []string{"logs"}, true},
 		{"remove-account still allowed", []string{"remove-account", "alice@example.com", "--yes"}, true},
+		{"pack-attachments allowed", []string{"pack-attachments"}, true},
+		{"repack-attachments allowed", []string{"repack-attachments"}, true},
+		{"unpack-attachments rejected", []string{"unpack-attachments"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2601,6 +2606,128 @@ func TestHandleCLIAttachmentReturnsContentAddressedBytes(t *testing.T) {
 	assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
 	assert.Equal(contentHash, w.Header().Get("X-Msgvault-Content-Hash"), "ContentHash")
 	assert.Equal(data, w.Body.Bytes(), "data")
+}
+
+// buildTestPack seals content into a single-blob pack under
+// attachmentsDir/packs/ and returns the resulting store index entry. Not a
+// Test-prefixed function, so testify-helper-check does not require a local
+// assert/require helper here — and critically, keeping "require" unshadowed
+// in the caller lets each t.Run subtest below declare its own
+// require.New(t)/assert.New(t) bound to the subtest's own *testing.T.
+func buildTestPack(t *testing.T, attachmentsDir string, content []byte) store.PackIndexEntry {
+	t.Helper()
+	staging := t.TempDir()
+	w, err := pack.NewWriter(staging, pack.WriterOptions{})
+	require.NoError(t, err, "NewWriter")
+	_, err = w.Append(content)
+	require.NoError(t, err, "Append")
+	packID := w.ID()
+	final := filepath.Join(attachmentsDir, "packs", packID[:2], packID+blobstore.PackExt)
+	require.NoError(t, os.MkdirAll(filepath.Dir(final), 0o700), "create pack dir")
+	sealed, err := w.Seal(final)
+	require.NoError(t, err, "Seal")
+	require.Len(t, sealed, 1, "sealed entries")
+
+	return store.PackIndexEntry{
+		BlobHash:  sealed[0].ID.String(),
+		PackID:    packID,
+		Offset:    int64(sealed[0].Offset),
+		StoredLen: int64(sealed[0].StoredLen),
+		RawLen:    int64(sealed[0].RawLen),
+		Flags:     uint8(sealed[0].Flags),
+		CRC32C:    sealed[0].CRC32C,
+	}
+}
+
+// TestCLIAttachmentServesPackedBlob covers the daemon attachment endpoint's
+// blobstore-backed path: a packed blob is served from a sealed pack, an
+// unknown hash 404s, and a loose file is still served through the same
+// BlobStore-configured server (the nil-BlobStore path is exercised
+// separately by TestHandleCLIAttachmentReturnsContentAddressedBytes).
+func TestCLIAttachmentServesPackedBlob(t *testing.T) {
+	must := require.New(t)
+	dataDir := t.TempDir()
+	attachmentsDir := filepath.Join(dataDir, "attachments")
+
+	content := []byte("packed attachment bytes")
+	entry := buildTestPack(t, attachmentsDir, content)
+
+	st := testutil.NewTestStore(t)
+	src, err := st.GetOrCreateSource("gmail", "alice@example.com")
+	must.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(src.ID, "packed-thread", "Packed Thread")
+	must.NoError(err, "EnsureConversation")
+	msgID, err := st.UpsertMessage(&store.Message{
+		ConversationID: convID, SourceID: src.ID,
+		SourceMessageID: "packed-message", MessageType: "email",
+	})
+	must.NoError(err, "UpsertMessage")
+	must.NoError(st.UpsertAttachment(msgID, "packed.bin", "application/octet-stream",
+		entry.BlobHash[:2]+"/"+entry.BlobHash, entry.BlobHash, len(content)), "UpsertAttachment packed")
+	must.NoError(st.RecordPackedBlobs(store.PackRecord{
+		PackID:      entry.PackID,
+		EntryCount:  1,
+		StoredBytes: entry.StoredLen,
+		CreatedAt:   time.Now(),
+	}, []store.PackIndexEntry{entry}), "RecordPackedBlobs")
+
+	bs := blobstore.New(st, attachmentsDir)
+	// Close cached pack readers before t.TempDir cleanup; Windows cannot
+	// delete the .mvpack file while a reader holds it open.
+	t.Cleanup(func() { assert.NoError(t, bs.Close(), "close blob store") })
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{
+			Data: config.DataConfig{DataDir: dataDir},
+		},
+		Logger:    testLogger(),
+		BlobStore: bs,
+	})
+
+	t.Run("packed blob returns 200 with body", func(t *testing.T) {
+		assert := assert.New(t)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/attachment?content_hash="+entry.BlobHash, nil)
+		w := httptest.NewRecorder()
+
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusOK, w.Code, "status")
+		assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
+		assert.Equal(entry.BlobHash, w.Header().Get("X-Msgvault-Content-Hash"), "ContentHash")
+		assert.Equal(content, w.Body.Bytes(), "data")
+	})
+
+	t.Run("unknown hash returns 404", func(t *testing.T) {
+		assert := assert.New(t)
+		unknownHash := "bf0803740e367e2f5e45f0813f62b9c4c09a44e8a649a39970295a9322859048"
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/attachment?content_hash="+unknownHash, nil)
+		w := httptest.NewRecorder()
+
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusNotFound, w.Code, "status")
+	})
+
+	t.Run("loose file fallback still served", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		looseHash := "220a1f4bfb5bd7d3fc13a5b9475afc62f88b94bbd7177ea4581e8049288a6bd2"
+		looseContent := []byte("loose fallback bytes")
+		require.NoError(st.UpsertAttachment(msgID, "loose.bin", "application/octet-stream",
+			looseHash[:2]+"/"+looseHash, looseHash, len(looseContent)), "UpsertAttachment loose")
+		looseDir := filepath.Join(attachmentsDir, looseHash[:2])
+		require.NoError(os.MkdirAll(looseDir, 0o755), "create loose dir")
+		require.NoError(os.WriteFile(filepath.Join(looseDir, looseHash), looseContent, 0o600), "write loose attachment")
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/attachment?content_hash="+looseHash, nil)
+		w := httptest.NewRecorder()
+
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusOK, w.Code, "status")
+		assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
+		assert.Equal(looseContent, w.Body.Bytes(), "data")
+	})
 }
 
 func TestHandleListMessages(t *testing.T) {

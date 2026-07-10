@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/kit/backup"
 	"go.kenn.io/msgvault/internal/backupapp"
+	"go.kenn.io/msgvault/internal/blobstore"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
@@ -233,15 +235,46 @@ func runBackupRestore(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("restoring snapshot: %w", err)
 	}
+	if err := clearRestoredPackMetadata(res.DBPath); err != nil {
+		return err
+	}
 	out := cmd.OutOrStdout()
 	_, _ = fmt.Fprintf(out, "Restored snapshot %s to %s\n", res.SnapshotID, backupRestoreTarget)
 	_, _ = fmt.Fprintf(out, "Database: %s (%s)\n", res.DBPath, formatSize(res.DBBytes))
 	_, _ = fmt.Fprintf(out, "Attachments: %d (%s)\n", res.AttachmentBlobs, formatSize(res.AttachmentBytes))
+	_, _ = fmt.Fprintf(out, "Pack metadata cleared: attachments were restored as loose files; 'msgvault pack-attachments' will re-pack them\n")
 	if res.ExtrasFiles > 0 {
 		_, _ = fmt.Fprintf(out, "Extras files: %d\n", res.ExtrasFiles)
 	}
 	_, _ = fmt.Fprintf(out, "Proof: integrity_check ok, manifest stats match\n")
 	_, _ = fmt.Fprintf(out, "Duration: %.1fs\n", res.Duration.Seconds())
+	return nil
+}
+
+// clearRestoredPackMetadata opens the just-restored database and deletes all
+// attachment_pack_index/attachment_packs rows. Restore materializes
+// attachment blobs as loose canonical files only — production pack files are
+// never part of a snapshot — so pack metadata carried in the restored DB
+// would point at packs that do not exist: reads of previously packed blobs
+// would fail, and worse, a later pack-attachments run would not re-pack those
+// "already indexed" hashes while its sweep deleted their restored loose files.
+// Clearing the two tables yields a genuinely fully-unpacked vault that
+// pack-attachments re-packs from scratch.
+//
+// The snapshot may predate the pack tables; ClearAttachmentPackMetadata checks
+// for them and does nothing when absent, avoiding unrelated schema migrations
+// after the restore proof has already completed. dbPath comes from the restore
+// result and is always a SQLite file under the target directory, never the
+// configured live archive (or PostgreSQL).
+func clearRestoredPackMetadata(dbPath string) error {
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open restored database %s: %w", dbPath, err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.ClearAttachmentPackMetadata(); err != nil {
+		return fmt.Errorf("clear restored pack metadata: %w", err)
+	}
 	return nil
 }
 
@@ -364,6 +397,23 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 		return fmt.Errorf("opening backup repository: %w", err)
 	}
 
+	// Capture reads attachment bytes through the production blob store
+	// (packs + loose fallback) rather than the engine's own ContentDir
+	// reads, so a packed vault backs up without any loose files. The
+	// read-only SQLite connection alongside the daemon's writer is safe
+	// under WAL. Kit releases the daemon's operation gate after pinning the
+	// database snapshot, before attachment capture, so maintenance can run
+	// concurrently; blob-store reads finish through an already-open pack,
+	// follow a replacement mapping, or fail loudly and leave the backup
+	// retryable.
+	roStore, err := store.OpenReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("open archive for backup content reads: %w", err)
+	}
+	defer func() { _ = roStore.Close() }()
+	blobs := blobstore.New(roStore, cfg.AttachmentsDir())
+	defer func() { _ = blobs.Close() }()
+
 	freezer, closeFreezer, err := newBackupFreezer()
 	if err != nil {
 		return err
@@ -389,6 +439,7 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 	m, err := backup.Create(cmd.Context(), r, backupapp.New(Version), backup.CreateOptions{
 		DBPath:                dbPath,
 		ContentDir:            cfg.AttachmentsDir(),
+		ContentSource:         backupapp.NewContentSource(blobs, cfg.AttachmentsDir()),
 		DataDir:               cfg.Data.DataDir,
 		Extras:                extras,
 		IncludeConfig:         backupCreateIncludeConfig,

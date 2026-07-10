@@ -2,7 +2,11 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,9 +18,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/msgvault/internal/blobstore"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/packer"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -244,6 +250,65 @@ func TestRemoveAccountCmd_PreservesSharedAttachments(t *testing.T) {
 
 	_, err = os.Stat(filePath)
 	assert.NoError(t, err, "shared attachment file should be preserved")
+}
+
+func TestRemoveAccountCmd_DeletesUniquePackedMappings(t *testing.T) {
+	require := require.New(t)
+	tmpDir := t.TempDir()
+	attachmentsDir := filepath.Join(tmpDir, "attachments")
+	content := []byte("unique packed attachment")
+	hash := fmt.Sprintf("%x", sha256.Sum256(content))
+	storagePath := hash[:2] + "/" + hash
+	thumbnail := []byte("unique packed thumbnail")
+	thumbnailHash := fmt.Sprintf("%x", sha256.Sum256(thumbnail))
+	thumbnailPath := thumbnailHash[:2] + "/" + thumbnailHash
+
+	s, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
+	require.NoError(err)
+	require.NoError(s.InitSchema())
+	seedMessageWithAttachment(t, s,
+		"alice@example.com", "thread-a", "msg-a", storagePath, hash)
+	_, err = s.DB().Exec(s.Rebind(`
+		UPDATE attachments SET thumbnail_hash = ?, thumbnail_path = ?
+		WHERE content_hash = ?`), thumbnailHash, thumbnailPath, hash)
+	require.NoError(err)
+	seedAttachmentFile(t, attachmentsDir, storagePath, string(content))
+	seedAttachmentFile(t, attachmentsDir, thumbnailPath, string(thumbnail))
+	packed, err := packer.Run(context.Background(), s, attachmentsDir, packer.Options{})
+	require.NoError(err)
+	require.Equal(2, packed.BlobsPacked)
+	require.NoError(s.Close())
+
+	savedCfg := cfg
+	defer func() { cfg = savedCfg }()
+	cfg = &config.Config{
+		HomeDir: tmpDir,
+		Data:    config.DataConfig{DataDir: tmpDir},
+	}
+
+	root := newTestRootCmd()
+	root.AddCommand(newRemoveAccountLocalTestCmd())
+	root.SetArgs([]string{"remove-account", "alice@example.com", "--yes"})
+	getOutput := captureStdout(t)
+	require.NoError(root.Execute(), "packed removal succeeds without unpacking first")
+	output := getOutput()
+	assert.Contains(t, output, "Removed 2 packed blob mapping(s)")
+	assert.Contains(t, output, "repack")
+
+	removed, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
+	require.NoError(err)
+	defer func() { require.NoError(removed.Close()) }()
+	_, err = removed.GetSourceByIdentifier("alice@example.com")
+	require.ErrorIs(err, store.ErrSourceNotFound)
+	bs := blobstore.New(removed, attachmentsDir)
+	defer func() { require.NoError(bs.Close()) }()
+	_, _, err = bs.Open(hash)
+	require.ErrorIs(err, fs.ErrNotExist, "removed blob is no longer addressable by hash")
+	_, _, err = bs.Open(thumbnailHash)
+	require.ErrorIs(err, fs.ErrNotExist, "removed thumbnail is no longer addressable by hash")
+	recs, err := removed.ListPackRecords()
+	require.NoError(err)
+	assert.Len(t, recs, 1, "logical deletion leaves immutable pack reclamation to repack")
 }
 
 func TestRemoveAccountCmd_SkipsDeletionDuringActiveSync(t *testing.T) {
