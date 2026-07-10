@@ -120,6 +120,17 @@ func newTestHandlers(eng query.Engine) *handlers {
 	return &handlers{engine: eng}
 }
 
+type listAccountsTrackingEngine struct {
+	*querytest.MockEngine
+
+	listAccountsCalled bool
+}
+
+func (e *listAccountsTrackingEngine) ListAccounts(ctx context.Context) ([]query.AccountInfo, error) {
+	e.listAccountsCalled = true
+	return e.MockEngine.ListAccounts(ctx)
+}
+
 // callToolDirect invokes a handler directly with the given arguments and returns the raw result.
 func callToolDirect(t *testing.T, name string, fn toolHandler, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
@@ -288,6 +299,39 @@ func TestSearchMessageBodies(t *testing.T) {
 		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{"query": "from:alice"})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "free-text term")
+	})
+
+	t.Run("rejects invalid typed operator values", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			query string
+			op    string
+		}{
+			{name: "bad date", query: "needle before:not-a-date", op: "before:"},
+			{name: "bad size", query: "needle larger:5X", op: "larger:"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				var searchRan bool
+				invalid := &listAccountsTrackingEngine{
+					MockEngine: &querytest.MockEngine{
+						Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}},
+						SearchMessageBodiesFunc: func(context.Context, *search.Query, int, int) ([]query.MessageSummary, error) {
+							searchRan = true
+							return nil, nil
+						},
+					},
+				}
+				r := runToolExpectError(t, "search_message_bodies",
+					newTestHandlers(invalid).searchMessageBodies,
+					map[string]any{"query": tc.query, "account": "alice@example.com"})
+				txt := resultText(t, r)
+				assert.Contains(t, txt, "invalid value")
+				assert.Contains(t, txt, tc.op)
+				assert.False(t, invalid.listAccountsCalled, "invalid query must not resolve account filters")
+				assert.False(t, searchRan, "invalid query must not reach body search")
+			})
+		}
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -499,6 +543,37 @@ func TestSearchMessageBodies_RealEngineFTSNormalizedContext(t *testing.T) {
 			assert.Contains(exact[0], tc.wantContext)
 		})
 	}
+}
+
+func TestSearchMessageBodies_PhraseContextSurvivesSnippetCap(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+
+	gap := strings.Repeat("é ", searchContextChars)
+	body := strings.Repeat("alpha "+gap, maxContextSnippets+1) + "alpha beta marker"
+	messageID := f.NewMessage().
+		WithSourceMessageID("mcp-phrase-context").
+		WithSubject("ordinary subject").
+		WithSnippet("ordinary preview").
+		Create(t, f.Store)
+	require.NoError(f.Store.UpsertMessageBody(messageID,
+		sql.NullString{String: body, Valid: true}, sql.NullString{}), "UpsertMessageBody")
+	_, err := f.Store.BackfillFTS(nil)
+	require.NoError(err, "BackfillFTS")
+
+	engine := query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL())
+	resp := runTool[paginatedSearchMessages](t, "search_message_bodies",
+		newTestHandlers(engine).searchMessageBodies, map[string]any{"query": `"alpha beta"`})
+	require.Len(resp.Data, 1, "phrase hit")
+	assert.Equal(messageID, resp.Data[0].ID, "phrase hit ID")
+	var foundPhrase bool
+	for _, snippet := range resp.Data[0].ContextSnippets {
+		foundPhrase = foundPhrase || strings.Contains(snippet, "alpha beta")
+		assert.LessOrEqual(len(snippet), searchContextChars, "bounded phrase context")
+		assert.True(utf8.ValidString(snippet), "phrase context must be valid UTF-8")
+	}
+	assert.True(foundPhrase, "context snippets must include the matched phrase")
 }
 
 func TestExtractContextChar(t *testing.T) {

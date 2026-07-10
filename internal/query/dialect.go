@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"go.kenn.io/msgvault/internal/sqldialect"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -91,6 +92,11 @@ type Dialect interface {
 	// must emit "col = 1"; PostgreSQL has a real BOOLEAN type and rejects
 	// integer comparisons, so the bare column name is the right form.
 	BoolTrueExpr(col string) string
+
+	// UnicodeLowerExpression returns a Unicode-aware lowercasing SQL expression.
+	// SQLite delegates to a deterministic Go scalar registered on every
+	// connection; PostgreSQL uses its collation-aware LOWER implementation.
+	UnicodeLowerExpression(expr string) string
 }
 
 // SQLiteQueryDialect implements Dialect for SQLite.
@@ -99,6 +105,10 @@ type SQLiteQueryDialect struct{}
 func (SQLiteQueryDialect) Rebind(query string) string { return query }
 
 func (SQLiteQueryDialect) BoolTrueExpr(col string) string { return col + " = 1" }
+
+func (SQLiteQueryDialect) UnicodeLowerExpression(expr string) string {
+	return sqliteutil.UnicodeLowerFunction + "(" + expr + ")"
+}
 
 func (SQLiteQueryDialect) TimeTruncExpression(column string, granularity string) string {
 	switch granularity {
@@ -185,6 +195,10 @@ func (PostgreSQLQueryDialect) Rebind(query string) string {
 
 func (PostgreSQLQueryDialect) BoolTrueExpr(col string) string { return col }
 
+func (PostgreSQLQueryDialect) UnicodeLowerExpression(expr string) string {
+	return "LOWER(" + expr + ")"
+}
+
 func (PostgreSQLQueryDialect) TimeTruncExpression(column string, granularity string) string {
 	switch granularity {
 	case "year":
@@ -248,16 +262,30 @@ func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg str
 }
 
 func (PostgreSQLQueryDialect) BuildFTSBodyTerm(terms []string) (expr string, arg string) {
-	tsTerms := make([]string, 0, len(terms))
+	termGroups := make([]string, 0, len(terms))
 	for _, term := range terms {
-		for _, lex := range sqldialect.EscapeTSQueryTerm(term) {
-			tsTerms = append(tsTerms, lex+":*D")
+		lexemes := sqldialect.EscapeTSQueryTerm(term)
+		parts := make([]string, len(lexemes))
+		for i, lexeme := range lexemes {
+			suffix := ":D"
+			if i == len(lexemes)-1 {
+				suffix = ":*D"
+			}
+			parts[i] = lexeme + suffix
+		}
+		switch len(parts) {
+		case 0:
+			continue
+		case 1:
+			termGroups = append(termGroups, parts[0])
+		default:
+			termGroups = append(termGroups, "("+strings.Join(parts, " <-> ")+")")
 		}
 	}
-	if len(tsTerms) == 0 {
+	if len(termGroups) == 0 {
 		return "FALSE", ""
 	}
-	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(tsTerms, " & ")
+	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(termGroups, " & ")
 }
 
 func (PostgreSQLQueryDialect) FTSBodySearchReadinessSQL() string {

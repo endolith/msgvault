@@ -10,12 +10,13 @@ import (
 	"unicode"
 
 	"github.com/mattn/go-sqlite3"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
 // SQLiteDialect implements Dialect for SQLite (the default backend).
 type SQLiteDialect struct{}
 
-func (d *SQLiteDialect) DriverName() string { return "sqlite3" }
+func (d *SQLiteDialect) DriverName() string { return sqliteutil.DriverName() }
 
 // Rebind is a no-op for SQLite — it uses ? placeholders natively.
 func (d *SQLiteDialect) Rebind(query string) string { return query }

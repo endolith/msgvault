@@ -415,6 +415,14 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("query parameter is required"), nil
 	}
 
+	q := search.Parse(queryStr)
+	if err := q.Err(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
+		return mcp.NewToolResultError(msg), nil
+	}
+
 	limit := searchLimitArg(args)
 	offset := limitArg(args, "offset", 0)
 
@@ -424,10 +432,6 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	q := search.Parse(queryStr)
-	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return mcp.NewToolResultError(msg), nil
-	}
 	if sourceID != nil {
 		q.AccountIDs = []int64{*sourceID}
 	}
@@ -1128,22 +1132,28 @@ func contextBodyLexemes(body string) []contextLexeme {
 }
 
 // extractContextChar returns up to contextChars of body text centered on each
-// normalized FTS token-prefix match, merging overlapping windows.
+// normalized FTS term-group match, merging overlapping windows. Lexemes within
+// one parsed term stay adjacent: all but the final lexeme match exactly and the
+// final lexeme uses prefix semantics, mirroring the body FTS dialects.
 func extractContextChar(body string, terms []string, contextChars int) []string {
 	if body == "" || len(terms) == 0 || contextChars <= 0 {
 		return nil
 	}
 
-	var queryLexemes []string
+	queryGroups := make([][]string, 0, len(terms))
 	for _, term := range terms {
+		var group []string
 		for _, lexeme := range sqldialect.EscapeTSQueryTerm(term) {
 			normalized := normalizeContextLexeme(lexeme)
 			if normalized != "" {
-				queryLexemes = append(queryLexemes, normalized)
+				group = append(group, normalized)
 			}
 		}
+		if len(group) > 0 {
+			queryGroups = append(queryGroups, group)
+		}
 	}
-	if len(queryLexemes) == 0 {
+	if len(queryGroups) == 0 {
 		return nil
 	}
 	bodyLexemes := contextBodyLexemes(body)
@@ -1153,11 +1163,25 @@ func extractContextChar(body string, terms []string, contextChars int) []string 
 	}
 	var spans []span
 
-	for _, queryLexeme := range queryLexemes {
-		for _, bodyLexeme := range bodyLexemes {
-			if strings.HasPrefix(bodyLexeme.normalized, queryLexeme) {
-				matchLen := min(bodyLexeme.end-bodyLexeme.start, contextChars)
-				start, end := contextWindow(len(body), bodyLexeme.start, matchLen, contextChars)
+	for _, group := range queryGroups {
+		for bodyIndex := 0; bodyIndex+len(group) <= len(bodyLexemes); bodyIndex++ {
+			matched := true
+			for groupIndex, queryLexeme := range group {
+				bodyLexeme := bodyLexemes[bodyIndex+groupIndex]
+				if groupIndex == len(group)-1 {
+					matched = strings.HasPrefix(bodyLexeme.normalized, queryLexeme)
+				} else {
+					matched = bodyLexeme.normalized == queryLexeme
+				}
+				if !matched {
+					break
+				}
+			}
+			if matched {
+				first := bodyLexemes[bodyIndex]
+				last := bodyLexemes[bodyIndex+len(group)-1]
+				matchLen := min(last.end-first.start, contextChars)
+				start, end := contextWindow(len(body), first.start, matchLen, contextChars)
 				spans = append(spans, span{start: start, end: end})
 			}
 		}

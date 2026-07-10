@@ -1798,6 +1798,12 @@ func (e *SQLiteEngine) SearchMessageBodies(ctx context.Context, q *search.Query,
 // SearchFast and SearchFastCount. Structured operators retain the generic
 // Search semantics, while free text is deliberately kept off the composite
 // body FTS index.
+func metadataContainsExpression(d Dialect, column string) string {
+	value := d.UnicodeLowerExpression("COALESCE(" + column + ", '')")
+	pattern := d.UnicodeLowerExpression("?")
+	return fmt.Sprintf(`%s LIKE %s ESCAPE '\'`, value, pattern)
+}
+
 func (e *SQLiteEngine) buildMetadataSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []any, ftsJoin string) {
 	structured := *q
 	structured.TextTerms = nil
@@ -1805,19 +1811,19 @@ func (e *SQLiteEngine) buildMetadataSearchQueryParts(ctx context.Context, q *sea
 
 	for _, term := range q.TextTerms {
 		pattern := "%" + escapeSQLiteLike(term) + "%"
-		conditions = append(conditions, `(
-			LOWER(COALESCE(m.subject, '')) LIKE LOWER(?) ESCAPE '\' OR
-			LOWER(COALESCE(m.snippet, '')) LIKE LOWER(?) ESCAPE '\' OR
+		conditions = append(conditions, fmt.Sprintf(`(
+			%s OR
+			%s OR
 			EXISTS (
 				SELECT 1
 				FROM message_recipients mr_meta
 				JOIN participants p_meta ON p_meta.id = mr_meta.participant_id
 				WHERE mr_meta.message_id = m.id
 				  AND (
-					LOWER(COALESCE(p_meta.email_address, '')) LIKE LOWER(?) ESCAPE '\' OR
-					LOWER(COALESCE(p_meta.display_name, '')) LIKE LOWER(?) ESCAPE '\' OR
-					LOWER(COALESCE(p_meta.phone_number, '')) LIKE LOWER(?) ESCAPE '\' OR
-					LOWER(COALESCE(mr_meta.display_name, '')) LIKE LOWER(?) ESCAPE '\'
+					%s OR
+					%s OR
+					%s OR
+					%s
 				  )
 			) OR
 			EXISTS (
@@ -1825,12 +1831,22 @@ func (e *SQLiteEngine) buildMetadataSearchQueryParts(ctx context.Context, q *sea
 				FROM participants p_direct_meta
 				WHERE p_direct_meta.id = m.sender_id
 				  AND (
-					LOWER(COALESCE(p_direct_meta.email_address, '')) LIKE LOWER(?) ESCAPE '\' OR
-					LOWER(COALESCE(p_direct_meta.display_name, '')) LIKE LOWER(?) ESCAPE '\' OR
-					LOWER(COALESCE(p_direct_meta.phone_number, '')) LIKE LOWER(?) ESCAPE '\'
+					%s OR
+					%s OR
+					%s
 				  )
 			)
-		)`)
+		)`,
+			metadataContainsExpression(e.dialect, "m.subject"),
+			metadataContainsExpression(e.dialect, "m.snippet"),
+			metadataContainsExpression(e.dialect, "p_meta.email_address"),
+			metadataContainsExpression(e.dialect, "p_meta.display_name"),
+			metadataContainsExpression(e.dialect, "p_meta.phone_number"),
+			metadataContainsExpression(e.dialect, "mr_meta.display_name"),
+			metadataContainsExpression(e.dialect, "p_direct_meta.email_address"),
+			metadataContainsExpression(e.dialect, "p_direct_meta.display_name"),
+			metadataContainsExpression(e.dialect, "p_direct_meta.phone_number"),
+		))
 		for range 9 {
 			args = append(args, pattern)
 		}

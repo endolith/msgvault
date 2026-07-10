@@ -126,6 +126,55 @@ func TestSearchFastWithStats_MetadataPredicateConsistency(t *testing.T) {
 	}
 }
 
+func TestSearchFast_MetadataUnicodeCaseFold(t *testing.T) {
+	f := storetest.New(t)
+	ctx := context.Background()
+
+	subjectID := createSearchScopeMessage(t, f, "unicode-metadata-subject",
+		"École newsletter", "ordinary preview", "ordinary body", 0, 0)
+	snippetID := createSearchScopeMessage(t, f, "unicode-metadata-snippet",
+		"ordinary subject", "École preview", "ordinary body", 0, 0)
+	senderID := f.EnsureParticipant("unicode@example.com", "Élodie Example", "example.com")
+	senderMessageID := createSearchScopeMessage(t, f, "unicode-metadata-sender",
+		"ordinary subject", "ordinary preview", "ordinary body", senderID, 0)
+
+	engine := query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL())
+	tests := []struct {
+		name    string
+		term    string
+		wantIDs []int64
+	}{
+		{name: "subject and snippet", term: "école", wantIDs: []int64{subjectID, snippetID}},
+		{name: "participant display name", term: "élodie", wantIDs: []int64{senderMessageID}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			q := &search.Query{TextTerms: []string{tc.term}}
+			var gotIDs []int64
+			for offset := range len(tc.wantIDs) {
+				page, err := engine.SearchFast(ctx, q, query.MessageFilter{}, 1, offset)
+				require.NoError(err, "SearchFast page %d", offset)
+				require.Len(page, 1, "SearchFast page %d", offset)
+				gotIDs = append(gotIDs, page[0].ID)
+			}
+			assert.ElementsMatch(tc.wantIDs, gotIDs, "paginated message IDs")
+
+			count, err := engine.SearchFastCount(ctx, q, query.MessageFilter{})
+			require.NoError(err, "SearchFastCount")
+			assert.Equal(int64(len(tc.wantIDs)), count, "total count")
+
+			result, err := engine.SearchFastWithStats(ctx, q, tc.term,
+				query.MessageFilter{}, query.ViewSenders, 1, 0)
+			require.NoError(err, "SearchFastWithStats")
+			require.NotNil(result.Stats, "metadata stats")
+			assert.Equal(count, result.TotalCount, "result total")
+			assert.Equal(count, result.Stats.MessageCount, "stats total")
+		})
+	}
+}
+
 // TestSearchMessageBodies_BodyColumnOnly runs against SQLite by default and
 // PostgreSQL in the test-pg lane. Every non-body FTS field carries the same
 // term in a different message, proving the optional capability scopes the
@@ -151,12 +200,11 @@ func TestSearchMessageBodies_BodyColumnOnly(t *testing.T) {
 	_, err := f.Store.BackfillFTS(nil)
 	require.NoError(err, "BackfillFTS")
 
-	engine := query.NewSQLiteEngine(f.Store.DB())
-	if f.Store.IsPostgreSQL() {
-		engine = query.NewEngineWithDialect(f.Store.DB(), query.PostgreSQLQueryDialect{})
-	}
+	engine := query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL())
+	bodySearcher, ok := engine.(query.MessageBodySearcher)
+	require.True(ok, "production query engine must expose exact body search")
 
-	messages, err := engine.SearchMessageBodies(ctx, &search.Query{TextTerms: []string{"scopeword"}}, 50, 0)
+	messages, err := bodySearcher.SearchMessageBodies(ctx, &search.Query{TextTerms: []string{"scopeword"}}, 50, 0)
 	require.NoError(err, "SearchMessageBodies")
 	require.Len(messages, 1, "body-only hits")
 	assert.Equal(bodyID, messages[0].ID, "body-only hit ID")
@@ -185,13 +233,38 @@ func TestSearchMessageBodies_PostgreSQLRejectsStaleLayout(t *testing.T) {
 	require.NoError(err, "mark layout stale")
 	assert.True(f.Store.NeedsFTSBackfill(), "stale version needs backfill")
 
-	engine := query.NewEngineWithDialect(f.Store.DB(), query.PostgreSQLQueryDialect{})
-	_, err = engine.SearchMessageBodies(context.Background(),
+	engine := query.NewEngine(f.Store.DB(), true)
+	bodySearcher, ok := engine.(query.MessageBodySearcher)
+	require.True(ok, "production PostgreSQL engine must expose exact body search")
+	_, err = bodySearcher.SearchMessageBodies(context.Background(),
 		&search.Query{TextTerms: []string{"stalecheck"}}, 50, 0)
 	require.Error(err, "stale body search must fail closed")
 	require.ErrorIs(err, query.ErrMessageBodySearchIndexStale)
 	assert.Contains(err.Error(), "rebuild-fts")
 	assert.Contains(err.Error(), "backfill")
+}
+
+func TestSearchMessageBodies_PhraseGrouping(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	ctx := context.Background()
+
+	adjacentID := createSearchScopeMessage(t, f, "body-phrase-adjacent",
+		"ordinary subject", "ordinary preview", "alpha beta marker", 0, 0)
+	createSearchScopeMessage(t, f, "body-phrase-separated",
+		"ordinary subject", "ordinary preview", "alpha between beta", 0, 0)
+	_, err := f.Store.BackfillFTS(nil)
+	require.NoError(err, "BackfillFTS")
+
+	engine := query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL())
+	bodySearcher, ok := engine.(query.MessageBodySearcher)
+	require.True(ok, "production query engine must expose exact body search")
+	messages, err := bodySearcher.SearchMessageBodies(ctx,
+		&search.Query{TextTerms: []string{"alpha beta"}}, 50, 0)
+	require.NoError(err, "SearchMessageBodies")
+	require.Len(messages, 1, "phrase body hits")
+	assert.Equal(adjacentID, messages[0].ID, "adjacent phrase hit")
 }
 
 func createSearchScopeMessage(
