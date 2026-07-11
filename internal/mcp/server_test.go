@@ -3078,7 +3078,7 @@ func TestSearchMetadataTool_DocumentsQuerySyntax(t *testing.T) {
 // contract so MCP clients know how body FTS interprets free-text terms.
 func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
 	assert := assert.New(t)
-	tool := searchMessageBodiesTool(false)
+	tool := searchMessageBodiesTool()
 
 	assert.Contains(tool.Description, "ANDed", "tool description should document implicit AND, got: %q", tool.Description)
 	assert.Contains(tool.Description, "double-quoted phrase", "tool description should document phrase matching, got: %q", tool.Description)
@@ -3095,7 +3095,7 @@ func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
 // tokens are literal body text.
 func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
 	assert := assert.New(t)
-	tool := searchMessageBodiesTool(false)
+	tool := searchMessageBodiesTool()
 
 	assert.Contains(tool.Description, "metadata filters", "tool description should distinguish filters from free text, got: %q", tool.Description)
 	assert.Contains(tool.Description, "Unrecognized word:value", "tool description should document literal colon tokens, got: %q", tool.Description)
@@ -3110,7 +3110,7 @@ func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
 // contract for when excerpt lists are capped.
 func TestSearchMessageBodiesTool_DocumentsMatchesTruncated(t *testing.T) {
 	assert := assert.New(t)
-	tool := searchMessageBodiesTool(false)
+	tool := searchMessageBodiesTool()
 
 	assert.Contains(tool.Description, "matches_truncated",
 		"tool description should document matches_truncated, got: %q", tool.Description)

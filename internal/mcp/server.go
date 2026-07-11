@@ -19,6 +19,7 @@ import (
 const (
 	ToolSearchMetadata      = "search_metadata"
 	ToolSearchMessageBodies = "search_message_bodies"
+	ToolSemanticSearchMessages = "semantic_search_messages"
 	ToolGetMessage          = "get_message"
 	ToolGetAttachment       = "get_attachment"
 	ToolExportAttachment    = "export_attachment"
