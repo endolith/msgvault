@@ -124,7 +124,7 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	vectorAvailable := opts.HybridEngine != nil || opts.HybridSearcher != nil
 	s.AddTool(searchMetadataTool(), h.searchMetadata)
 	s.AddTool(searchMessageBodiesTool(), h.searchMessageBodies)
-	s.AddTool(semanticSearchMessagesTool(vectorAvailable), h.searchMessageBodies)
+	s.AddTool(semanticSearchMessagesTool(vectorAvailable), h.semanticSearchMessages)
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
 	s.AddTool(searchInMessageTool(), h.searchInMessage)
@@ -320,7 +320,7 @@ func semanticSearchMessagesTool(vectorAvailable bool) mcp.Tool {
 		withLimit("20"),
 		withOffset(),
 		mcp.WithString("mode",
-			mcp.Description("Search mode: vector (semantic only) or hybrid (BM25 + vector fused via RRF)."),
+			mcp.Description("Search mode: vector (semantic only) or hybrid (BM25 + vector fused via RRF). Defaults to hybrid when omitted."),
 			mcp.Enum(searchModeVector, searchModeHybrid),
 		),
 		mcp.WithBoolean("explain",

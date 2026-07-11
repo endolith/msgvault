@@ -411,13 +411,16 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	if mode == "" {
 		mode = searchModeKeyword
 	}
-	explain, _ := args["explain"].(bool)
 
 	switch mode {
-	case searchModeKeyword, searchModeVector, searchModeHybrid:
+	case searchModeKeyword:
+	case searchModeVector, searchModeHybrid:
+		return mcp.NewToolResultError(
+			fmt.Sprintf("invalid mode %q: search_message_bodies is keyword-only; use semantic_search_messages for vector or hybrid search", mode),
+		), nil
 	default:
 		return mcp.NewToolResultError(
-			fmt.Sprintf("invalid mode %q: must be %s, %s, or %s (default %s)", mode, searchModeKeyword, searchModeVector, searchModeHybrid, searchModeKeyword),
+			fmt.Sprintf("invalid mode %q: search_message_bodies only supports keyword search; use semantic_search_messages for vector or hybrid search", mode),
 		), nil
 	}
 
@@ -427,10 +430,6 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	}
 	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
 		return mcp.NewToolResultError(msg), nil
-	}
-
-	if mode == searchModeVector || mode == searchModeHybrid {
-		return h.searchMessageBodiesHybrid(ctx, args, queryStr, q, mode, explain)
 	}
 
 	limit := searchLimitArg(args)
@@ -502,6 +501,44 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 		paginatedResponse: newPaginatedResponseNoTotal(data, offset, hasMore),
 		Mode:              searchModeKeyword,
 	})
+}
+
+// semanticSearchMessages runs vector/hybrid body search. Unlike
+// searchMessageBodies (keyword), mode defaults to hybrid and keyword is
+// rejected. Vector availability, the free-text requirement, and index
+// staleness are all enforced by the shared searchMessageBodiesHybrid path,
+// which returns vector_not_enabled when vector search is not configured.
+func (h *handlers) semanticSearchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	queryStr, _ := args["query"].(string)
+	if queryStr == "" {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	mode, _ := args["mode"].(string)
+	if mode == "" {
+		mode = searchModeHybrid
+	}
+	switch mode {
+	case searchModeVector, searchModeHybrid:
+	default:
+		return mcp.NewToolResultError(
+			fmt.Sprintf("invalid mode %q: must be %s or %s (default %s); use search_message_bodies for keyword search",
+				mode, searchModeVector, searchModeHybrid, searchModeHybrid),
+		), nil
+	}
+	explain, _ := args["explain"].(bool)
+
+	q := search.Parse(queryStr)
+	if err := q.Err(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
+		return mcp.NewToolResultError(msg), nil
+	}
+
+	return h.searchMessageBodiesHybrid(ctx, args, queryStr, q, mode, explain)
 }
 
 // hybridScoreBreakdown exposes fused-score components for debugging.

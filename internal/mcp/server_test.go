@@ -235,6 +235,8 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 					},
 				}}
 				h := &handlers{engine: engine}
+				toolName := "search_message_bodies"
+				handler := h.searchMessageBodies
 				var localBackend *fakeBackend
 				args := map[string]any{
 					"query":   queryCase.text,
@@ -246,15 +248,19 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 					h = newHybridHandlersForErrorTest(localBackend)
 					h.engine = engine
 					args["mode"] = searchModeHybrid
+					toolName = "semantic_search_messages"
+					handler = h.semanticSearchMessages
 				case "daemon hybrid":
 					h.hybridSearcher = hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
 						backendCalled = true
 						return nil, errors.New("unexpected daemon hybrid search")
 					})
 					args["mode"] = searchModeHybrid
+					toolName = "semantic_search_messages"
+					handler = h.semanticSearchMessages
 				}
 
-				result := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, args)
+				result := runToolExpectError(t, toolName, handler, args)
 				text := resultText(t, result)
 				for _, want := range queryCase.want {
 					assert.Contains(text, want)
@@ -994,12 +1000,43 @@ func TestSearchMessageBodies_HybridModeNotConfigured(t *testing.T) {
 	// mode=hybrid (and mode=vector) with a vector_not_enabled error.
 	h := newTestHandlers(&querytest.MockEngine{})
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "meeting notes",
 		"mode":  searchModeHybrid,
 	})
 	txt := resultText(t, r)
 	assert.Contains(t, txt, "vector_not_enabled", "expected 'vector_not_enabled' error, got: %s")
+}
+
+// TestSemanticSearchMessages_DefaultsToHybrid guards the roborev fix: a
+// semantic_search_messages call with no mode must default to hybrid (not
+// keyword) and therefore return vector_not_enabled when vector search is
+// unavailable, rather than silently falling back to keyword results.
+func TestSemanticSearchMessages_DefaultsToHybrid(t *testing.T) {
+	h := newTestHandlers(&querytest.MockEngine{})
+
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
+		"query": "meeting notes",
+	})
+	txt := resultText(t, r)
+	assert.Contains(t, txt, "vector_not_enabled",
+		"no-mode semantic search must default to hybrid and require vector, got: %s", txt)
+}
+
+// TestSearchMessageBodies_RejectsVectorHybridMode guards that the keyword-only
+// tool refuses vector/hybrid modes and points callers at semantic_search_messages.
+func TestSearchMessageBodies_RejectsVectorHybridMode(t *testing.T) {
+	h := newTestHandlers(&querytest.MockEngine{})
+
+	for _, mode := range []string{searchModeVector, searchModeHybrid} {
+		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+			"query": "notes",
+			"mode":  mode,
+		})
+		txt := resultText(t, r)
+		assert.Contains(t, txt, "keyword-only", "mode=%s should be rejected as keyword-only, got: %s", mode, txt)
+		assert.Contains(t, txt, "semantic_search_messages", "rejection should point to semantic tool, got: %s", txt)
+	}
 }
 
 func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
@@ -1037,7 +1074,7 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 		}),
 	}
 
-	resp := runTool[searchMessageBodiesResponse](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp := runTool[searchMessageBodiesResponse](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":   "quarterly plan",
 		"mode":    searchModeHybrid,
 		"account": "alice@example.com",
@@ -1070,7 +1107,7 @@ func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
 		}),
 	}
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "from:alice@example.com",
 		"mode":  searchModeHybrid,
 	})
@@ -1113,7 +1150,7 @@ func TestSearchMessageBodies_HybridErrIndexBuilding(t *testing.T) {
 		building:  building,
 	})
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "anything",
 		"mode":  searchModeHybrid,
 	})
@@ -1132,7 +1169,7 @@ func TestSearchMessageBodies_HybridErrNotEnabled(t *testing.T) {
 		activeErr: vector.ErrNoActiveGeneration,
 	})
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "anything",
 		"mode":  searchModeHybrid,
 	})
@@ -1159,7 +1196,7 @@ func TestSearchMessageBodies_HybridErrIndexScopeMismatch(t *testing.T) {
 		backend:      backend,
 	}
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "anything",
 		"mode":  searchModeVector,
 	})
@@ -1209,7 +1246,7 @@ func TestSearchMessageBodies_HybridFilterOnlyReturnsMissingFreeText(t *testing.T
 		backend:      backend,
 	}
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "from:alice@example.com",
 		"mode":  searchModeVector,
 	})
@@ -1241,7 +1278,7 @@ func TestSearchMessageBodies_HybridPoolSaturatedAlwaysEmitted(t *testing.T) {
 		backend:      backend,
 	}
 
-	r := callToolDirect(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := callToolDirect(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "hello world",
 		"mode":  searchModeVector,
 	})
@@ -1292,7 +1329,7 @@ func TestSearchMessageBodies_HybridModePagination(t *testing.T) {
 		Total    int64 `json:"total"`
 		HasMore  bool  `json:"has_more"`
 	}
-	resp := runTool[hybridPage](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp := runTool[hybridPage](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(1),
@@ -1344,7 +1381,7 @@ func TestSearchMessageBodies_HybridPagination_NoUnreachableHasMore(t *testing.T)
 		Total   int64 `json:"total"`
 		HasMore bool  `json:"has_more"`
 	}
-	resp := runTool[hybridPage](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp := runTool[hybridPage](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(40),
@@ -1356,7 +1393,7 @@ func TestSearchMessageBodies_HybridPagination_NoUnreachableHasMore(t *testing.T)
 	assert.Equal(int64(totalCountUnknown), resp.Total, "total")
 	assert.False(resp.HasMore, "has_more")
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(60),
@@ -1402,7 +1439,7 @@ func TestSearchMessageBodies_HybridPagination_NoHasMoreAtMaxPageBoundary(t *test
 		Total   int64 `json:"total"`
 		HasMore bool  `json:"has_more"`
 	}
-	resp := runTool[hybridPage](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp := runTool[hybridPage](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(30),
@@ -1414,7 +1451,7 @@ func TestSearchMessageBodies_HybridPagination_NoHasMoreAtMaxPageBoundary(t *test
 	assert.Equal(int64(totalCountUnknown), resp.Total, "total")
 	assert.False(resp.HasMore, "has_more")
 
-	r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(50),
@@ -1458,7 +1495,7 @@ func TestSearchMessageBodies_HybridPagination_ProbeRowDetectsMore(t *testing.T) 
 		} `json:"data"`
 		HasMore bool `json:"has_more"`
 	}
-	resp := runTool[hybridPage](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp := runTool[hybridPage](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query": "hit",
 		"mode":  searchModeVector,
 		"limit": float64(20),
@@ -1468,7 +1505,7 @@ func TestSearchMessageBodies_HybridPagination_ProbeRowDetectsMore(t *testing.T) 
 	require.Len(resp.Data, 20, "data")
 	assert.True(resp.HasMore, "has_more")
 
-	resp2 := runTool[hybridPage](t, "search_message_bodies", h.searchMessageBodies, map[string]any{
+	resp2 := runTool[hybridPage](t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
 		"query":  "hit",
 		"mode":   searchModeVector,
 		"offset": float64(20),
