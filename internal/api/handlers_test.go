@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2682,6 +2683,7 @@ func TestCLIAttachmentServesPackedBlob(t *testing.T) {
 		},
 		Logger:    testLogger(),
 		BlobStore: bs,
+		Engine:    query.NewEngine(st.DB(), st.IsPostgreSQL()),
 	})
 
 	t.Run("packed blob returns 200 with body", func(t *testing.T) {
@@ -2695,6 +2697,67 @@ func TestCLIAttachmentServesPackedBlob(t *testing.T) {
 		assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
 		assert.Equal(entry.BlobHash, w.Header().Get("X-Msgvault-Content-Hash"), "ContentHash")
 		assert.Equal(content, w.Body.Bytes(), "data")
+	})
+
+	t.Run("public content endpoint serves packed blob", func(t *testing.T) {
+		assert := assert.New(t)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+entry.BlobHash+"/content", nil)
+		w := httptest.NewRecorder()
+
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+		assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
+		assert.Equal(`attachment; filename="packed.bin"`, w.Header().Get("Content-Disposition"), "Content-Disposition")
+		assert.Equal(content, w.Body.Bytes(), "data")
+	})
+
+	t.Run("public content endpoint serves legacy namespaced loose blob", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		hash := "5bc8e75b9fa9867b99fe7498fcb611a46ab49326ff94a96b2a6f68a723f46d91"
+		legacyContent := []byte("legacy namespaced attachment")
+		storagePath := filepath.Join("synctech-sms", hash[:2], hash)
+		require.NoError(st.UpsertAttachment(msgID, "legacy.bin", "application/octet-stream",
+			storagePath, hash, len(legacyContent)), "UpsertAttachment legacy")
+		require.NoError(os.MkdirAll(filepath.Join(attachmentsDir, filepath.Dir(storagePath)), 0o700), "create legacy dir")
+		require.NoError(os.WriteFile(filepath.Join(attachmentsDir, storagePath), legacyContent, 0o600), "write legacy attachment")
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+hash+"/content", nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+		assert.Equal(legacyContent, w.Body.Bytes(), "data")
+	})
+
+	t.Run("public content endpoint tries every duplicate hash path", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		hash := "80c92207dd517f7edb6479ca8694460ed21ddf969f52e17e2ba7808f706cce74"
+		availableContent := []byte("available duplicate attachment")
+		availablePath := filepath.Join("synctech-sms", hash[:2], hash)
+
+		require.NoError(st.UpsertAttachment(msgID, "missing.bin", "application/x-missing",
+			filepath.Join("missing", hash), hash, len(availableContent)), "UpsertAttachment missing duplicate")
+		availableMsgID, err := st.UpsertMessage(&store.Message{
+			ConversationID: convID, SourceID: src.ID,
+			SourceMessageID: "available-duplicate-message", MessageType: "email",
+		})
+		require.NoError(err, "UpsertMessage available duplicate")
+		require.NoError(st.UpsertAttachment(availableMsgID, "available.bin", "text/plain",
+			availablePath, hash, len(availableContent)), "UpsertAttachment available duplicate")
+		require.NoError(os.MkdirAll(filepath.Join(attachmentsDir, filepath.Dir(availablePath)), 0o700), "create available duplicate dir")
+		require.NoError(os.WriteFile(filepath.Join(attachmentsDir, availablePath), availableContent, 0o600), "write available duplicate")
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+hash+"/content", nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+
+		assert.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+		assert.Equal("text/plain", w.Header().Get("Content-Type"), "Content-Type")
+		assert.Equal(`attachment; filename="available.bin"`, w.Header().Get("Content-Disposition"), "Content-Disposition")
+		assert.Equal(availableContent, w.Body.Bytes(), "data")
 	})
 
 	t.Run("unknown hash returns 404", func(t *testing.T) {
@@ -6001,4 +6064,168 @@ func TestHandleGetMessage_EngineUnsupportedFallsBackToStore(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp), "decode")
 	assert.Equal(t, "Test Subject", resp["subject"], "subject (store path response)")
+}
+
+// newAttachmentTestServer builds a Server whose config points at a temp data
+// dir, so AttachmentsDir() resolves to a writable location for seeding files.
+func newAttachmentTestServer(t *testing.T, engine *querytest.MockEngine) (*Server, *config.Config) {
+	t.Helper()
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+		Data:   config.DataConfig{DataDir: t.TempDir()},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     &mockStore{},
+		Engine:    engine,
+		Scheduler: newMockScheduler(),
+		Logger:    testLogger(),
+	})
+	return srv, cfg
+}
+
+// seedAttachmentFile writes content to the content-addressed path under the
+// attachments dir (attachmentsDir/<hash[:2]>/<hash>).
+func seedAttachmentFile(t *testing.T, cfg *config.Config, hash string, content []byte) {
+	t.Helper()
+	dir := filepath.Join(cfg.AttachmentsDir(), hash[:2])
+	require.NoError(t, os.MkdirAll(dir, 0o755), "mkdir attachment dir")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, hash), content, 0o644), "write attachment file")
+}
+
+func TestHandleGetAttachmentContent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	hash := strings.Repeat("a1", 32) // 64 hex chars
+	content := []byte("hello attachment world")
+
+	engine := &querytest.MockEngine{
+		AttachmentsByHash: map[string][]query.AttachmentInfo{
+			hash: {{ID: 7, Filename: "report.pdf", MimeType: "application/pdf", Size: int64(len(content)), ContentHash: hash}},
+		},
+	}
+	srv, cfg := newAttachmentTestServer(t, engine)
+	seedAttachmentFile(t, cfg, hash, content)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+hash+"/content", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+	assert.Equal("application/pdf", w.Header().Get("Content-Type"), "Content-Type")
+	assert.Equal(`attachment; filename="report.pdf"`, w.Header().Get("Content-Disposition"), "Content-Disposition")
+	assert.Equal(strconv.Itoa(len(content)), w.Header().Get("Content-Length"), "Content-Length")
+	assert.Equal(content, w.Body.Bytes(), "body")
+}
+
+func TestHandleGetAttachmentContent_MissingMimeAndFilename(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	hash := strings.Repeat("bc", 32)
+	content := []byte{0x00, 0x01, 0x02}
+
+	engine := &querytest.MockEngine{
+		AttachmentsByHash: map[string][]query.AttachmentInfo{
+			hash: {{ID: 8, Size: int64(len(content)), ContentHash: hash}}, // no Filename, no MimeType
+		},
+	}
+	srv, cfg := newAttachmentTestServer(t, engine)
+	seedAttachmentFile(t, cfg, hash, content)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+hash+"/content", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+	assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
+	assert.Equal("attachment", w.Header().Get("Content-Disposition"), "Content-Disposition")
+}
+
+func TestHandleGetAttachmentContent_InvalidHash(t *testing.T) {
+	assert := assert.New(t)
+	srv, _ := newAttachmentTestServer(t, &querytest.MockEngine{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/not-a-valid-hash/content", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusBadRequest, w.Code, "status (body: %s)", w.Body.String())
+}
+
+func TestHandleGetAttachmentContent_UnknownHash(t *testing.T) {
+	assert := assert.New(t)
+	// Valid hash shape, but no metadata row for it.
+	srv, _ := newAttachmentTestServer(t, &querytest.MockEngine{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+strings.Repeat("de", 32)+"/content", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusNotFound, w.Code, "status (body: %s)", w.Body.String())
+}
+
+func TestHandleGetAttachmentContent_MetadataButFileMissing(t *testing.T) {
+	assert := assert.New(t)
+	hash := strings.Repeat("ef", 32)
+	engine := &querytest.MockEngine{
+		AttachmentsByHash: map[string][]query.AttachmentInfo{
+			hash: {{ID: 9, Filename: "gone.bin", MimeType: "application/octet-stream", Size: 10, ContentHash: hash}},
+		},
+	}
+	srv, _ := newAttachmentTestServer(t, engine) // note: no seedAttachmentFile
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+hash+"/content", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusNotFound, w.Code, "status (body: %s)", w.Body.String())
+}
+
+func TestResolveRecordedAttachmentPathRejectsUnsafePaths(t *testing.T) {
+	assert := assert.New(t)
+	attachmentsDir := t.TempDir()
+
+	for _, storagePath := range []string{
+		"../outside.bin",
+		filepath.Join(string(filepath.Separator), "absolute.bin"),
+		"https://example.com/attachment.bin",
+	} {
+		_, err := resolveRecordedAttachmentPath(attachmentsDir, storagePath)
+		assert.Error(err, "storage path %q", storagePath)
+	}
+}
+
+// TestHandleGetMessage_ExposesAttachmentContentHash verifies the message
+// detail response carries each attachment's content_hash, so a client can
+// discover the hash to pass to GET /api/v1/attachments/{hash}/content.
+func TestHandleGetMessage_ExposesAttachmentContentHash(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	hash := strings.Repeat("ab", 32)
+	engine := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{
+			1: {
+				ID:             1,
+				Subject:        "With attachment",
+				SentAt:         time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+				HasAttachments: true,
+				Attachments: []query.AttachmentInfo{
+					{ID: 5, Filename: "report.pdf", MimeType: "application/pdf", Size: 1234, ContentHash: hash},
+				},
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/messages/1", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
+	var resp struct {
+		Attachments []map[string]any `json:"attachments"`
+	}
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode")
+	require.Len(resp.Attachments, 1, "attachments")
+	assert.Equal(hash, resp.Attachments[0]["content_hash"], "content_hash")
 }

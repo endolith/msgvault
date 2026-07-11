@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/fileutil"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/query"
@@ -2529,7 +2531,189 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, AttachmentInfo(*att))
+	writeJSON(w, http.StatusOK, AttachmentInfo{
+		ID:          att.ID,
+		Filename:    att.Filename,
+		MimeType:    att.MimeType,
+		Size:        att.Size,
+		ContentHash: att.ContentHash,
+		URL:         att.URL,
+	})
+}
+
+// handleGetAttachmentContent streams a stored attachment's raw bytes by its
+// SHA-256 content hash. The /content suffix keeps this binary response distinct
+// from GET /attachments/{id}, which returns attachment metadata as JSON.
+func (s *Server) handleGetAttachmentContent(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
+		return
+	}
+
+	hash := r.PathValue("hash")
+
+	if err := msgexport.ValidateContentHash(hash); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_hash", "Attachment hash must be a 64-character hex SHA-256")
+		return
+	}
+
+	attachments, err := s.engine.GetAttachmentsByHash(r.Context(), hash)
+	if err != nil {
+		s.logger.Error("failed to look up attachment by hash", "error", err, "hash", hash)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to look up attachment")
+		return
+	}
+	if len(attachments) == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "Attachment not found")
+		return
+	}
+	att := &attachments[0]
+
+	var content io.ReadCloser
+	var contentLength int64
+	if s.blobStore != nil {
+		content, contentLength, err = s.blobStore.Open(hash)
+	}
+	if s.blobStore == nil || errors.Is(err, os.ErrNotExist) {
+		content, contentLength, att, err = openLooseAttachmentCandidates(
+			s.cfg.AttachmentsDir(), hash, attachments,
+		)
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "not_found", "Attachment content not available")
+			return
+		}
+		s.logger.Error("failed to open attachment content", "error", err, "hash", hash)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to open attachment")
+		return
+	}
+	defer func() { _ = content.Close() }()
+
+	contentType := att.MimeType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", contentDisposition(att.Filename))
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if _, err := io.Copy(w, content); err != nil {
+		// Status and headers are already committed, so only logging is possible.
+		s.logger.Error("failed to stream attachment", "error", err, "hash", hash)
+	}
+}
+
+func openLooseAttachmentCandidates(
+	attachmentsDir string,
+	contentHash string,
+	attachments []query.AttachmentInfo,
+) (io.ReadCloser, int64, *query.AttachmentInfo, error) {
+	content, contentLength, err := openLooseAttachmentContent(attachmentsDir, contentHash, "")
+	if err == nil {
+		return content, contentLength, &attachments[0], nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, 0, nil, err
+	}
+
+	seen := make(map[string]struct{}, len(attachments))
+	var firstPathError error
+	for i := range attachments {
+		storagePath := attachments[i].StoragePath
+		if storagePath == "" {
+			continue
+		}
+		if _, ok := seen[storagePath]; ok {
+			continue
+		}
+		seen[storagePath] = struct{}{}
+
+		content, contentLength, err = openLooseAttachmentContent(attachmentsDir, contentHash, storagePath)
+		if err == nil {
+			return content, contentLength, &attachments[i], nil
+		}
+		if !errors.Is(err, os.ErrNotExist) && firstPathError == nil {
+			firstPathError = err
+		}
+	}
+	if firstPathError != nil {
+		return nil, 0, nil, firstPathError
+	}
+	return nil, 0, nil, os.ErrNotExist
+}
+
+func openLooseAttachmentContent(attachmentsDir, contentHash, storagePath string) (io.ReadCloser, int64, error) {
+	var path string
+	var err error
+	if storagePath == "" {
+		path, err = msgexport.StoragePath(attachmentsDir, contentHash)
+	} else {
+		path, err = resolveRecordedAttachmentPath(attachmentsDir, storagePath)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("attachment storage path %q is not a regular file", storagePath)
+	}
+	return f, info.Size(), nil
+}
+
+func resolveRecordedAttachmentPath(attachmentsDir, storagePath string) (string, error) {
+	lowerPath := strings.ToLower(storagePath)
+	if strings.HasPrefix(lowerPath, "http://") || strings.HasPrefix(lowerPath, "https://") {
+		return "", errors.New("attachment storage path must be local")
+	}
+	localPath := filepath.Clean(filepath.FromSlash(storagePath))
+	if !filepath.IsLocal(localPath) {
+		return "", fmt.Errorf("attachment storage path %q escapes attachments directory", storagePath)
+	}
+	basePath, err := filepath.Abs(attachmentsDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve attachments directory: %w", err)
+	}
+	basePath, err = filepath.EvalSymlinks(basePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve attachments directory: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(filepath.Join(basePath, localPath))
+	if err != nil {
+		return "", err
+	}
+	relativePath, err := filepath.Rel(basePath, resolvedPath)
+	if err != nil || !filepath.IsLocal(relativePath) {
+		return "", fmt.Errorf("attachment storage path %q escapes attachments directory", storagePath)
+	}
+	return resolvedPath, nil
+}
+
+func contentDisposition(filename string) string {
+	if filename == "" {
+		return "attachment"
+	}
+	ascii := strings.Map(func(r rune) rune {
+		if r < 0x20 || r >= 0x7f || r == '"' || r == '\\' {
+			return '_'
+		}
+		return r
+	}, filename)
+	value := fmt.Sprintf("attachment; filename=%q", ascii)
+	if ascii != filename {
+		value += "; filename*=UTF-8''" + url.PathEscape(filename)
+	}
+	return value
 }
 
 func (s *Server) handleSearchByDomains(w http.ResponseWriter, r *http.Request) {

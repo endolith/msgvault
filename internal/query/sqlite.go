@@ -1026,23 +1026,51 @@ func (e *SQLiteEngine) getMessageByQuery(ctx context.Context, whereClause string
 // GetAttachment retrieves attachment metadata by ID.
 func (e *SQLiteEngine) GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error) {
 	var att AttachmentInfo
-	var storagePath string
 	err := e.queryRowContext(ctx, `
 		SELECT id, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, '')
 		FROM attachments
 		WHERE id = ?
-	`, id).Scan(&att.ID, &att.Filename, &att.MimeType, &att.Size, &att.ContentHash, &storagePath)
+	`, id).Scan(&att.ID, &att.Filename, &att.MimeType, &att.Size, &att.ContentHash, &att.StoragePath)
 	if err == sql.ErrNoRows {
 		return nil, nil //nolint:nilnil // Engine.GetAttachment uses (nil, nil) for not-found; callers branch on the nil result
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get attachment: %w", err)
 	}
-	if isURLStoragePath(storagePath) {
-		att.URL = storagePath
+	if isURLStoragePath(att.StoragePath) {
+		att.URL = att.StoragePath
 		att.ContentHash = ""
+		att.StoragePath = ""
 	}
 	return &att, nil
+}
+
+// GetAttachmentsByHash retrieves all attachment metadata matching a content
+// hash in stable ID order.
+func (e *SQLiteEngine) GetAttachmentsByHash(ctx context.Context, contentHash string) ([]AttachmentInfo, error) {
+	rows, err := e.queryContext(ctx, `
+		SELECT id, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, '')
+		FROM attachments
+		WHERE content_hash = ?
+		ORDER BY id
+	`, contentHash)
+	if err != nil {
+		return nil, fmt.Errorf("get attachments by hash: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var attachments []AttachmentInfo
+	for rows.Next() {
+		var att AttachmentInfo
+		if err := rows.Scan(&att.ID, &att.Filename, &att.MimeType, &att.Size, &att.ContentHash, &att.StoragePath); err != nil {
+			return nil, fmt.Errorf("scan attachment by hash: %w", err)
+		}
+		attachments = append(attachments, att)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate attachments by hash: %w", err)
+	}
+	return attachments, nil
 }
 
 // GetMessageRaw returns the decompressed raw MIME data for a message.

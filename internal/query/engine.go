@@ -41,6 +41,11 @@ type Engine interface {
 	GetMessageBySourceID(ctx context.Context, sourceMessageID string) (*MessageDetail, error)
 	GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error)
 
+	// GetAttachmentsByHash returns every attachment matching the given content
+	// hash in stable ID order. Multiple rows may refer to the same bytes while
+	// retaining different filenames, MIME types, and legacy storage paths.
+	GetAttachmentsByHash(ctx context.Context, contentHash string) ([]AttachmentInfo, error)
+
 	// GetMessageRaw returns the decompressed raw MIME data for a message.
 	// Returns nil, nil if no raw data is stored for the given ID.
 	GetMessageRaw(ctx context.Context, id int64) ([]byte, error)
