@@ -3,15 +3,15 @@ package mcp
 import (
 	"testing"
 
-	assertpkg "github.com/stretchr/testify/assert"
-	requirepkg "github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
 func TestChunkHitsToMatches_ordersByScoreAndMapsOffsets(t *testing.T) {
 	t.Parallel()
-	assert := assertpkg.New(t)
-	require := requirepkg.New(t)
+	assert := assert.New(t)
+	require := require.New(t)
 
 	preprocessed := "Subject: Hello\n\nFirst paragraph about budgets.\n\nSecond paragraph."
 	body := "First paragraph about budgets.\n\nSecond paragraph."
@@ -33,8 +33,8 @@ func TestChunkHitsToMatches_ordersByScoreAndMapsOffsets(t *testing.T) {
 
 func TestChunkHitsToMatches_minScoreAndTruncation(t *testing.T) {
 	t.Parallel()
-	assert := assertpkg.New(t)
-	require := requirepkg.New(t)
+	assert := assert.New(t)
+	require := require.New(t)
 
 	body := "alpha beta gamma delta"
 	hits := []vector.ChunkHit{
@@ -51,8 +51,8 @@ func TestChunkHitsToMatches_minScoreAndTruncation(t *testing.T) {
 
 func TestExtractContextMatches_keywordShape(t *testing.T) {
 	t.Parallel()
-	assert := assertpkg.New(t)
-	require := requirepkg.New(t)
+	assert := assert.New(t)
+	require := require.New(t)
 
 	body := "Line one\nLine two with TARGET here\nLine three"
 	matches := extractContextMatches(body, []string{"TARGET"}, 80)
