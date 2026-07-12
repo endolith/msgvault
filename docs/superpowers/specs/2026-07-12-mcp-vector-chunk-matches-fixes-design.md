@@ -31,8 +31,15 @@ describe conditional tool registration.
 Chunk scoring will happen in the daemon/API process, where the hybrid engine,
 vector backend, active generation, and message bodies already coexist. The
 hybrid-search HTTP response will gain a bounded list of scored chunk matches per
-message. The daemon client and MCP adapter will preserve those matches instead
-of asking the MCP process to open a vector database or call the embedder again.
+message. Enrichment is opt-in through an explicit request parameter so existing
+CLI and TUI searches retain their summary-only latency. The daemon client and
+MCP adapter will request and preserve those matches instead of asking the MCP
+process to open a vector database or call the embedder again.
+
+The vector/hybrid HTTP path will accept an offset and return one requested page
+plus an explicit `has_more` signal. It may fetch a wider ranked prefix
+internally, but it will hydrate bodies and score chunks only for the page being
+returned. This avoids enriching the offset rows and probe row that MCP discards.
 
 The MCP in-process path will use the same response-level match shape and helper
 semantics. This keeps local/library use and production daemon use consistent.
@@ -54,10 +61,19 @@ Keyword matches continue to return required raw-body `char_offset` and `line`
 fields.
 
 Vector matches always return `snippet` and `score`. Their `char_offset` and
-`line` fields become optional. The implementation may emit them only when the
-preprocessed chunk can be located exactly and unambiguously in the raw body.
-Otherwise the fields are omitted. This prevents incorrect `center_at`
-navigation without requiring an embedding-schema migration or index rebuild.
+`line` fields become optional pointer fields. A non-nil pointer preserves the
+legitimate zero value for a chunk at the start of the raw body; nil omits the
+field from JSON. Keyword matches always populate both pointers. Vector matches
+populate them only when the preprocessed chunk can be located exactly and
+unambiguously in the raw body. Otherwise the fields are omitted. This prevents
+incorrect `center_at` navigation without requiring an embedding-schema
+migration or index rebuild.
+
+Omitted vector locations are the expected common production case, not an error.
+All preprocessing transforms default on, including whitespace collapsing, so
+byte-exact raw-body location will usually fail. Callers that need navigation can
+use distinctive terms from the semantic snippet with keyword
+`search_in_message`, which returns raw-body offsets.
 
 Subject-containing chunks are valid semantic matches because the existing
 embedding corpus is built from preprocessed subject plus body. Documentation
@@ -84,7 +100,8 @@ Regression coverage will exercise production behavior across component
 boundaries:
 
 - API hybrid search returns bounded scored chunk matches and honors
-  `min_score` for excerpts.
+  opt-in enrichment, page offsets, and `min_score` for excerpts without
+  hydrating discarded rows.
 - The generated/daemon client conversion preserves match fields.
 - The MCP daemon adapter returns those matches to tool callers.
 - In-process MCP search uses identical match semantics.
