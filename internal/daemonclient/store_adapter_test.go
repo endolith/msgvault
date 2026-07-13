@@ -1,9 +1,12 @@
 package daemonclient
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/contentverify"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/store"
 	apiclient "go.kenn.io/msgvault/pkg/client"
@@ -936,6 +940,7 @@ func TestGetCLISearch_Success(t *testing.T) {
 
 func TestGetCLIHybridSearch_Success(t *testing.T) {
 	assert := assert.New(t)
+	require := require.New(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/search", r.URL.Path, "path")
 		assert.Equal("lunch", r.URL.Query().Get("q"), "query")
@@ -944,12 +949,16 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 		assert.Equal("Important", r.URL.Query().Get("collection"), "collection query")
 		assert.Equal("sms", r.URL.Query().Get("message_type"), "message_type query")
 		assert.Equal("25", r.URL.Query().Get("page_size"), "page_size query")
+		assert.Equal("5", r.URL.Query().Get("offset"), "offset query")
+		assert.Equal("true", r.URL.Query().Get("include_matches"), "include_matches query")
+		assert.Equal("0.75", r.URL.Query().Get("min_score"), "min_score query")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"query": "lunch",
 			"mode": "vector",
-			"returned": 1,
-			"pool_saturated": false,
+				"returned": 1,
+				"pool_saturated": false,
+				"has_more": true,
 			"scope_label": "Important",
 			"scope_source_count": 2,
 			"took_ms": 12,
@@ -971,7 +980,13 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 				"has_attachments": false,
 				"labels": ["INBOX"],
 				"to": ["bob@example.com"],
-				"size_bytes": 512,
+					"size_bytes": 512,
+					"matches": [{
+						"char_offset": 0,
+						"line": 1,
+						"snippet": "Lunch tomorrow",
+						"score": 0.88
+					}],
 				"score": {
 					"rrf": 0.5,
 					"bm25": 1.25,
@@ -987,16 +1002,19 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 	resp, err := s.GetCLIHybridSearch(
 		context.Background(),
 		CLIHybridSearchRequest{
-			Query:        "lunch",
-			Collection:   "Important",
-			MessageTypes: []string{"sms"},
-			Mode:         "vector",
-			Limit:        25,
+			Query:          "lunch",
+			Collection:     "Important",
+			MessageTypes:   []string{"sms"},
+			Mode:           "vector",
+			Limit:          25,
+			Offset:         5,
+			IncludeMatches: true,
+			MinScore:       0.75,
 		},
 	)
-	require.NoError(t, err, "GetCLIHybridSearch")
+	require.NoError(err, "GetCLIHybridSearch")
 
-	require.Len(t, resp.Results, 1, "Results")
+	require.Len(resp.Results, 1, "Results")
 	assert.Equal(int64(42), resp.Results[0].ID, "result ID")
 	assert.Equal("Lunch", resp.Results[0].Subject, "result Subject")
 	assert.Equal("alice@example.com", resp.Results[0].FromEmail, "result FromEmail")
@@ -1013,6 +1031,13 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 	assert.Equal(int64(7), resp.Generation.ID, "Generation.ID")
 	assert.Equal("Important", resp.ScopeLabel, "ScopeLabel")
 	assert.Equal(2, resp.ScopeSourceCount, "ScopeSourceCount")
+	assert.True(resp.HasMore, "HasMore")
+	require.Len(resp.Results[0].Matches, 1, "Matches")
+	require.NotNil(resp.Results[0].Matches[0].CharOffset, "CharOffset")
+	require.NotNil(resp.Results[0].Matches[0].Line, "Line")
+	assert.Equal(0, *resp.Results[0].Matches[0].CharOffset, "CharOffset")
+	assert.Equal(1, *resp.Results[0].Matches[0].Line, "Line")
+	assert.InDelta(0.88, resp.Results[0].Matches[0].Score, 1e-9, "match Score")
 }
 
 func TestGetCLIHybridSearchUsesGeneratedClientAdapter(t *testing.T) {
@@ -1474,8 +1499,8 @@ func TestGetCLIMessageRaw_NotFoundPreservesGeneratedDecodeError(t *testing.T) {
 
 func TestGetCLIAttachment_Success(t *testing.T) {
 	assert := assert.New(t)
-	contentHash := "61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0"
 	data := []byte("attachment bytes")
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
 		assert.Equal(contentHash, r.URL.Query().Get("content_hash"), "content_hash query")
@@ -1494,8 +1519,8 @@ func TestGetCLIAttachment_Success(t *testing.T) {
 func TestGetCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	contentHash := "61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0"
 	data := []byte("attachment bytes")
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
 
 	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
@@ -1512,8 +1537,8 @@ func TestGetCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 func TestOpenCLIAttachment_Success(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	contentHash := "61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0"
 	data := []byte("attachment bytes")
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
 		assert.Equal(contentHash, r.URL.Query().Get("content_hash"), "content_hash query")
@@ -1535,8 +1560,8 @@ func TestOpenCLIAttachment_Success(t *testing.T) {
 func TestOpenCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	contentHash := "61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0"
 	data := []byte("attachment bytes")
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
 
 	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
@@ -1552,6 +1577,41 @@ func TestOpenCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 	got, err := io.ReadAll(body)
 	require.NoError(err, "read stream")
 	assert.Equal(data, got, "data")
+}
+
+func TestGetCLIAttachmentRejectsSameLengthCorruption(t *testing.T) {
+	want := []byte("expected attachment")
+	corrupt := bytes.Clone(want)
+	corrupt[0] ^= 0xff
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(want))
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(corrupt)
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "key")
+	_, err := s.GetCLIAttachment(context.Background(), contentHash)
+	require.ErrorIs(t, err, contentverify.ErrMismatch)
+}
+
+func TestOpenCLIAttachmentRejectsSameLengthCorruption(t *testing.T) {
+	want := []byte("expected attachment")
+	corrupt := bytes.Clone(want)
+	corrupt[len(corrupt)-1] ^= 0xff
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(want))
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(corrupt)
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "key")
+	body, err := s.OpenCLIAttachment(context.Background(), contentHash)
+	require.NoError(t, err)
+	_, readErr := io.ReadAll(body)
+	require.ErrorIs(t, readErr, contentverify.ErrMismatch)
+	require.ErrorIs(t, body.Close(), contentverify.ErrMismatch)
 }
 
 func TestGetMessage_NotFound(t *testing.T) {
