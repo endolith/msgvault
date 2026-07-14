@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,6 +81,11 @@ type Client struct {
 
 	priorFolderStates    map[string]FolderState // saved states from the last completed sync
 	observedFolderStates map[string]FolderState // states captured during this session's listing
+	folderStateSave      func(string, FolderState)
+	pendingFolderStates  map[string]FolderState
+	pendingFolderCounts  map[string]int
+	pendingMessageFolder map[string]string
+	completedFolders     map[string]bool
 
 	// listProgress, when set, is invoked during message-list
 	// enumeration: once with done=0 after the mailbox list is known,
@@ -328,7 +334,7 @@ func addMessageIDsFromHeaderFetchResults(dst map[string]bool, msgs []*imapclient
 
 // enumerateMailbox lists UIDs in a single mailbox. A non-zero minUID
 // restricts the search to UIDs at or above it (new messages since a
-// saved UIDNEXT watermark). It handles network errors with one
+// saved UIDNEXT high water mark). It handles network errors with one
 // reconnect attempt.
 func (c *Client) enumerateMailbox(
 	ctx context.Context, mailbox string, minUID imap.UID,
@@ -440,12 +446,13 @@ func (c *Client) fetchMailboxMessageIDs(
 // Caller must hold mu.
 func (c *Client) buildLabelMap(
 	ctx context.Context, allMailboxes []string,
-) error {
+) (bool, error) {
 	c.msgIDToLabels = make(map[string][]string)
+	complete := true
 
 	for _, mailbox := range allMailboxes {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 		if mailbox == c.allMailFolder {
 			continue
@@ -453,6 +460,7 @@ func (c *Client) buildLabelMap(
 
 		uids, err := c.enumerateMailbox(ctx, mailbox, 0)
 		if err != nil {
+			complete = false
 			c.logger.Warn("skipping mailbox for label map",
 				"mailbox", mailbox, "error", err)
 			continue
@@ -463,6 +471,7 @@ func (c *Client) buildLabelMap(
 
 		msgIDs, err := c.fetchMailboxMessageIDs(ctx, mailbox, uids)
 		if err != nil {
+			complete = false
 			c.logger.Warn("failed to fetch envelopes for label map",
 				"mailbox", mailbox, "error", err)
 			continue
@@ -475,7 +484,7 @@ func (c *Client) buildLabelMap(
 		c.logger.Debug("built label map for mailbox",
 			"mailbox", mailbox, "messages", len(msgIDs))
 	}
-	return nil
+	return complete, nil
 }
 
 // buildMessageListCache enumerates mailboxes and populates
@@ -502,9 +511,10 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 
 	// Determine which mailboxes to list for canonical message IDs.
 	listMailboxes := allMailboxes
+	isGmailAllMail := false
 	if c.allMailFolder != "" {
-		isGmail := strings.HasPrefix(c.allMailFolder, "[Gmail]/")
-		if isGmail {
+		isGmailAllMail = strings.HasPrefix(c.allMailFolder, "[Gmail]/")
+		if isGmailAllMail {
 			// Gmail's All Mail contains every message except Trash
 			// and Spam. Enumerate those alongside All Mail to catch
 			// messages only in those folders.
@@ -518,45 +528,70 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 					listMailboxes, c.junkMailbox)
 			}
 		}
+	}
+
+	// Folder-state tracking skips unchanged mailboxes via STATUS
+	// UIDVALIDITY/UIDNEXT. Disabled under a date filter because a
+	// filtered run does not fetch everything up to UIDNEXT, so the
+	// high water mark would be wrong. When an \All mailbox exists, the label
+	// map still needs full enumeration if anything changed, but a fully
+	// unchanged resync can return immediately.
+	trackFolders := c.since.IsZero() && c.before.IsZero()
+	var folderStatuses map[string]FolderState
+	var unchangedStatuses int
+	if trackFolders {
+		c.observedFolderStates = make(map[string]FolderState, len(allMailboxes))
+		folderStatuses, unchangedStatuses = c.observeFolderStates(ctx, allMailboxes)
+		if c.allMailFolder != "" &&
+			len(folderStatuses) == len(allMailboxes) &&
+			unchangedStatuses == len(allMailboxes) {
+			maps.Copy(c.observedFolderStates, folderStatuses)
+			if c.listProgress != nil {
+				c.listProgress(0, len(allMailboxes), "", 0, 0)
+				c.listProgress(len(allMailboxes), len(allMailboxes), "", 0, unchangedStatuses)
+			}
+			c.logger.Info("skipped unchanged mailboxes",
+				"unchanged", unchangedStatuses, "total", len(allMailboxes))
+			c.messageListCache = []gmailapi.MessageID{}
+			return nil
+		}
+	} else {
+		c.clearFolderAcknowledgements()
+	}
+
+	labelMapComplete := true
+	if c.allMailFolder != "" {
 		// On non-Gmail servers with \All, enumerate all selectable
 		// mailboxes — \All may not be a superset of every folder.
 		// Enable dedup to handle overlaps regardless of server.
 		c.seenRFC822IDs = make(map[string]bool)
 		c.logger.Info("detected All Mail folder via \\All attribute",
 			"folder", c.allMailFolder,
-			"gmail", isGmail,
+			"gmail", isGmailAllMail,
 			"trash", c.trashMailbox,
 			"junk", c.junkMailbox,
 			"total_mailboxes", len(allMailboxes))
 
-		if err := c.buildLabelMap(ctx, allMailboxes); err != nil {
+		var err error
+		labelMapComplete, err = c.buildLabelMap(ctx, allMailboxes)
+		if err != nil {
 			return err
 		}
-	}
-
-	// Folder-state tracking skips unchanged mailboxes via STATUS
-	// UIDVALIDITY/UIDNEXT. Disabled under a date filter (a filtered
-	// run does not fetch everything up to UIDNEXT, so the watermark
-	// would be wrong) and when an \All mailbox exists (the label map
-	// needs full enumeration of every folder).
-	trackFolders := c.since.IsZero() && c.before.IsZero() && c.allMailFolder == ""
-	if trackFolders {
-		c.observedFolderStates = make(map[string]FolderState, len(listMailboxes))
 	}
 
 	var messages []gmailapi.MessageID
 	var unchangedFolders int
 
-	listOne := func(mailbox string) {
+	listOne := func(mailbox string) bool {
 		var minUID imap.UID
 		var observed *FolderState
-		if trackFolders {
-			status, err := c.statusFolder(ctx, mailbox)
-			if err != nil {
-				c.logger.Warn("STATUS failed, enumerating mailbox fully",
-					"mailbox", mailbox, "error", err)
-			} else {
+		var trackState FolderState
+		var canTrackFolder bool
+		if trackFolders && c.allMailFolder == "" {
+			if status, ok := folderStatuses[mailbox]; ok {
 				observed = &status
+				trackState = status
+				canTrackFolder = true
 				if prior, ok := c.priorFolderStates[mailbox]; ok &&
 					prior.UIDValidity == status.UIDValidity &&
 					prior.UIDNext <= status.UIDNext {
@@ -565,21 +600,29 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 						// no new messages possible, skip enumeration.
 						c.observedFolderStates[mailbox] = status
 						unchangedFolders++
-						return
+						return true
 					}
 					// Only new messages need listing.
 					minUID = imap.UID(prior.UIDNext)
 				}
+			}
+		} else if trackFolders && c.allMailFolder != "" {
+			if status, ok := folderStatuses[mailbox]; ok {
+				trackState = status
+				canTrackFolder = true
 			}
 		}
 
 		uids, err := c.enumerateMailbox(ctx, mailbox, minUID)
 		if err != nil {
 			c.logger.Warn("skipping mailbox", "mailbox", mailbox, "error", err)
-			return
+			return false
 		}
 		if observed != nil {
 			c.observedFolderStates[mailbox] = *observed
+		}
+		if canTrackFolder {
+			c.trackFolderMessages(mailbox, trackState, uids)
 		}
 		for _, uid := range uids {
 			messages = append(messages, gmailapi.MessageID{
@@ -588,18 +631,30 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			})
 		}
 		c.logger.Debug("listed mailbox", "mailbox", mailbox, "count", len(uids))
+		return true
 	}
 
 	if c.listProgress != nil {
 		c.listProgress(0, len(listMailboxes), "", 0, 0)
 	}
+	enumerationComplete := true
 	for i, mailbox := range listMailboxes {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		listOne(mailbox)
+		if !listOne(mailbox) {
+			enumerationComplete = false
+		}
 		if c.listProgress != nil {
 			c.listProgress(i+1, len(listMailboxes), mailbox, len(messages), unchangedFolders)
+		}
+	}
+	if trackFolders && c.allMailFolder != "" {
+		if labelMapComplete && enumerationComplete {
+			maps.Copy(c.observedFolderStates, folderStatuses)
+		} else {
+			c.observedFolderStates = nil
+			c.clearFolderAcknowledgements()
 		}
 	}
 	if unchangedFolders > 0 {

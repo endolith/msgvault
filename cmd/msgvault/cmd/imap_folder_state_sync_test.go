@@ -74,7 +74,7 @@ func TestSaveIMAPFolderStates_ErrorsBlockPersistence(t *testing.T) {
 
 	loaded, err := loadIMAPFolderStates(st, src.ID)
 	require.NoError(err)
-	assert.Empty(t, loaded, "a run with fetch errors must not advance folder watermarks")
+	assert.Empty(t, loaded, "a run with fetch errors must not advance folder high water marks")
 }
 
 func TestSaveIMAPFolderStates_LimitTruncationBlocksPersistence(t *testing.T) {
@@ -89,7 +89,7 @@ func TestSaveIMAPFolderStates_LimitTruncationBlocksPersistence(t *testing.T) {
 
 	loaded, err := loadIMAPFolderStates(st, src.ID)
 	require.NoError(err)
-	assert.Empty(t, loaded, "a --limit-truncated run must not advance folder watermarks")
+	assert.Empty(t, loaded, "a --limit-truncated run must not advance folder high water marks")
 }
 
 func TestSaveIMAPFolderStates_NonIMAPClientIsNoOp(t *testing.T) {
@@ -143,6 +143,37 @@ func TestIMAPFolderStateOptions_ForceRescanBypassesSavedStates(t *testing.T) {
 	assert.Empty(imapFolderStateOptions(st, src, true),
 		"--noresume must ignore saved folder states so every mailbox is re-enumerated")
 	assert.NotEmpty(imapFolderStateOptions(st, src, false))
+}
+
+func TestIMAPFolderStateSaveOption_PersistsCompletedFolders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, _ := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 2, "Archive": 1})
+	st := testutil.NewTestStore(t)
+	src, err := st.GetOrCreateSource("imap", "imap://alice@example.com")
+	require.NoError(err)
+
+	client := listedIMAPClient(t, addr, imapFolderStateSaveOption(st, src))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client.AcknowledgeMessages(ctx, []string{"INBOX|1"})
+	loaded, err := loadIMAPFolderStates(st, src.ID)
+	require.NoError(err)
+	assert.Empty(loaded, "partial folder acknowledgement must not persist its high water mark")
+
+	client.AcknowledgeMessages(ctx, []string{"INBOX|2"})
+	loaded, err = loadIMAPFolderStates(st, src.ID)
+	require.NoError(err)
+	require.Contains(loaded, "INBOX")
+	assert.Equal(uint32(3), loaded["INBOX"].UIDNext)
+	assert.NotContains(loaded, "Archive")
+
+	client.AcknowledgeMessages(ctx, []string{"Archive|1"})
+	loaded, err = loadIMAPFolderStates(st, src.ID)
+	require.NoError(err)
+	require.Contains(loaded, "Archive")
+	assert.Equal(uint32(2), loaded["Archive"].UIDNext)
 }
 
 func TestSaveIMAPFolderStates_StoreRoundTripValues(t *testing.T) {
