@@ -131,6 +131,9 @@ type Model struct {
 	// Texts mode state (separate from email viewState)
 	textState textState
 
+	// Meetings mode state (separate from email and text navigation state)
+	meetingState meetingState
+
 	// Version info for title bar
 	version string
 
@@ -139,7 +142,8 @@ type Model struct {
 	analyticsNotice string
 
 	// Terminal-dependent styles
-	styles tuiStyles
+	styles        tuiStyles
+	markdownCache *markdownCache
 
 	// Update notification
 	updateAvailable  string // Latest version if update available
@@ -192,10 +196,12 @@ type Model struct {
 	spinnerActive bool // True when spinner tick is running
 
 	// Request tracking to ignore stale async results
-	aggregateRequestID uint64 // Current request ID for aggregate data
-	loadRequestID      uint64 // Current request ID for message list
-	detailRequestID    uint64 // Current request ID for message detail
-	searchRequestID    uint64 // Current request ID for search results
+	aggregateRequestID     uint64 // Current request ID for aggregate data
+	loadRequestID          uint64 // Current request ID for message list
+	detailRequestID        uint64 // Current request ID for message detail
+	searchRequestID        uint64 // Current request ID for search results
+	presentationGeneration uint64 // Mode activation owning shared presentation
+	textRequestID          uint64 // Latest Text navigation/data request
 
 	// Search state
 	searchMode        searchModeKind  // Fast (Parquet) or Deep (FTS5)
@@ -242,6 +248,14 @@ func New(engine query.Engine, opts Options) Model {
 	ti.Placeholder = "search (Tab: deep)"
 	ti.CharLimit = 200
 	ti.SetWidth(50)
+	meetingInput := textinput.New()
+	meetingInput.Placeholder = "search meetings and transcripts"
+	meetingInput.CharLimit = 200
+	meetingInput.SetWidth(50)
+	meetingDetailInput := textinput.New()
+	meetingDetailInput.Placeholder = "find in transcript"
+	meetingDetailInput.CharLimit = 200
+	meetingDetailInput.SetWidth(40)
 
 	aggLimit := opts.AggregateLimit
 	if aggLimit == 0 {
@@ -281,10 +295,15 @@ func New(engine query.Engine, opts Options) Model {
 			msgSortField:     query.MessageSortByDate,
 			msgSortDirection: query.SortDesc,
 		},
+		meetingState: meetingState{
+			searchInput:       meetingInput,
+			detailSearchInput: meetingDetailInput,
+		},
 		pageSize:      20,
 		loading:       true,
 		spinnerActive: true,
 		styles:        newStyles(false),
+		markdownCache: newMarkdownCache(false, noColorRequested()),
 		selection: selectionState{
 			aggregateKeys:     make(map[string]bool),
 			aggregateViewType: query.ViewSenders, // Match initial viewType
@@ -321,10 +340,11 @@ func (m Model) checkForUpdate() tea.Cmd {
 
 // dataLoadedMsg is sent when aggregate data is loaded.
 type dataLoadedMsg struct {
-	rows          []query.AggregateRow
-	filteredStats *query.TotalStats // distinct message stats when search is active
-	err           error
-	requestID     uint64 // To detect stale responses
+	rows                   []query.AggregateRow
+	filteredStats          *query.TotalStats // distinct message stats when search is active
+	err                    error
+	requestID              uint64 // To detect stale responses
+	presentationGeneration uint64
 }
 
 // statsLoadedMsg is sent when stats are loaded.
@@ -359,6 +379,7 @@ type updateCheckMsg struct {
 // loadData fetches aggregate data based on current view settings.
 func (m Model) loadData() tea.Cmd {
 	requestID := m.aggregateRequestID
+	presentationGeneration := m.presentationGeneration
 	scopeLabel := m.scopeLabelForLog()
 	viewLabel := m.viewType.String()
 	searchTerm := m.searchQuery
@@ -380,12 +401,15 @@ func (m Model) loadData() tea.Cmd {
 			var rows []query.AggregateRow
 			var err error
 
-			// Use SubAggregate for sub-grouping, regular aggregate for top-level
-			if m.level == levelDrillDown {
-				rows, err = m.engine.SubAggregate(ctx, m.drillFilter, m.viewType, opts)
-			} else {
-				rows, err = m.engine.Aggregate(ctx, m.viewType, opts)
-			}
+			// Use an explicitly email-scoped filter at every aggregate level.
+			// SubAggregate is also valid without drill criteria and, unlike the
+			// generic Aggregate call, lets the TUI's mode constraint intersect
+			// an explicit message_type search instead of being overridden by it.
+			aggregateFilter := emailScopedMessageFilter(m.drillFilter)
+			aggregateFilter.SourceID = m.accountFilter
+			aggregateFilter.WithAttachmentsOnly = m.filters.attachmentsOnly
+			aggregateFilter.HideDeletedFromSource = m.filters.hideDeletedFromSource
+			rows, err = m.engine.SubAggregate(ctx, aggregateFilter, m.viewType, opts)
 			if err != nil {
 				slog.Warn("tui loadData failed",
 					"view", viewLabel,
@@ -409,20 +433,31 @@ func (m Model) loadData() tea.Cmd {
 			// where a message appears in multiple groups.
 			var filteredStats *query.TotalStats
 			if err == nil && opts.SearchQuery != "" {
-				statsOpts := query.StatsOptions{
-					SourceID:              m.accountFilter,
-					WithAttachmentsOnly:   m.filters.attachmentsOnly,
-					HideDeletedFromSource: m.filters.hideDeletedFromSource,
-					SearchQuery:           opts.SearchQuery,
-					GroupBy:               m.viewType,
+				scopedQuery, noMatches := emailScopedSearchQuery(opts.SearchQuery)
+				if noMatches {
+					filteredStats = &query.TotalStats{}
+				} else {
+					statsOpts := query.StatsOptions{
+						SourceID:              m.accountFilter,
+						WithAttachmentsOnly:   m.filters.attachmentsOnly,
+						HideDeletedFromSource: m.filters.hideDeletedFromSource,
+						SearchQuery:           scopedQuery,
+						GroupBy:               m.viewType,
+					}
+					filteredStats, _ = m.engine.GetTotalStats(ctx, statsOpts)
 				}
-				filteredStats, _ = m.engine.GetTotalStats(ctx, statsOpts)
 			}
 
-			return dataLoadedMsg{rows: rows, filteredStats: filteredStats, err: err, requestID: requestID}
+			return dataLoadedMsg{
+				rows: rows, filteredStats: filteredStats, err: err, requestID: requestID,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 		func(r any) tea.Msg {
-			return dataLoadedMsg{err: fmt.Errorf("query panic: %v", r), requestID: requestID}
+			return dataLoadedMsg{
+				err: fmt.Errorf("query panic: %v", r), requestID: requestID,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 	)
 }
@@ -468,36 +503,40 @@ func (m Model) loadAccounts() tea.Cmd {
 
 // messagesLoadedMsg is sent when message list is loaded.
 type messagesLoadedMsg struct {
-	messages  []query.MessageSummary
-	err       error
-	requestID uint64 // To detect stale responses
-	append    bool   // True when appending paginated results to existing list
+	messages               []query.MessageSummary
+	err                    error
+	requestID              uint64 // To detect stale responses
+	append                 bool   // True when appending paginated results to existing list
+	presentationGeneration uint64
 }
 
 // messageDetailLoadedMsg is sent when message detail is loaded.
 type messageDetailLoadedMsg struct {
-	detail    *query.MessageDetail
-	err       error
-	requestID uint64 // To detect stale responses
+	detail                 *query.MessageDetail
+	err                    error
+	requestID              uint64 // To detect stale responses
+	presentationGeneration uint64
 }
 
 // searchResultsMsg is sent when search results are loaded.
 type searchResultsMsg struct {
-	messages   []query.MessageSummary
-	totalCount int64             // Total matching messages (for "N of M" display)
-	stats      *query.TotalStats // Aggregate stats for the search results (size, attachments, etc.)
-	err        error
-	requestID  uint64 // To detect stale responses
-	append     bool   // True if these results should be appended (pagination)
+	messages               []query.MessageSummary
+	totalCount             int64             // Total matching messages (for "N of M" display)
+	stats                  *query.TotalStats // Aggregate stats for the search results (size, attachments, etc.)
+	err                    error
+	requestID              uint64 // To detect stale responses
+	append                 bool   // True if these results should be appended (pagination)
+	presentationGeneration uint64
 }
 
 // threadMessagesLoadedMsg is sent when thread messages are loaded.
 type threadMessagesLoadedMsg struct {
-	messages       []query.MessageSummary
-	conversationID int64
-	truncated      bool // True if more messages exist but were limited
-	err            error
-	requestID      uint64
+	messages               []query.MessageSummary
+	conversationID         int64
+	truncated              bool // True if more messages exist but were limited
+	err                    error
+	requestID              uint64
+	presentationGeneration uint64
 }
 
 // flashClearMsg clears the flash message after timeout.
@@ -536,6 +575,12 @@ const flashDuration = 4 * time.Second
 // searchPageSize is the number of results per page for search pagination.
 const searchPageSize = 100
 
+// emailMessageType scopes the original TUI mode to email records. The shared
+// query datasets also contain meetings and text messages, so every Email-mode
+// query must carry this explicit constraint. Query engines interpret "email"
+// as typed email plus legacy NULL/empty message_type rows.
+const emailMessageType = "email"
+
 // messageListPageSize is the number of results per page for message list pagination.
 const messageListPageSize = 500
 
@@ -551,6 +596,7 @@ func (m Model) loadSearch(queryStr string) tea.Cmd {
 // loadSearchWithOffset executes the search query with pagination.
 func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults bool) tea.Cmd {
 	requestID := m.searchRequestID
+	presentationGeneration := m.presentationGeneration
 	modeLabel := "fast"
 	if m.searchMode != searchModeFast {
 		modeLabel = "deep"
@@ -560,6 +606,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 		func() tea.Msg {
 			ctx := context.Background()
 			q := search.Parse(queryStr)
+			searchFilter := emailScopedMessageFilter(m.searchFilter)
 
 			start := time.Now()
 			var results []query.MessageSummary
@@ -592,7 +639,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 
 			if m.searchMode == searchModeFast {
 				// Fast search: single-scan with temp table materialization
-				result, fastErr := m.engine.SearchFastWithStats(ctx, q, queryStr, m.searchFilter, m.viewType, searchPageSize, offset)
+				result, fastErr := m.engine.SearchFastWithStats(ctx, q, queryStr, searchFilter, m.viewType, searchPageSize, offset)
 				if fastErr == nil {
 					results = result.Messages
 					totalCount = result.TotalCount
@@ -604,7 +651,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 			} else {
 				// Deep search: FTS5 body search
 				// Merge context filter into query to honor drill-down context
-				mergedQuery := query.MergeFilterIntoQuery(q, m.searchFilter)
+				mergedQuery := query.MergeFilterIntoQuery(q, searchFilter)
 				results, err = m.engine.Search(ctx, mergedQuery, searchPageSize, offset)
 				// For deep search, estimate total from result count (no separate count query)
 				if err == nil && offset == 0 {
@@ -617,33 +664,74 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 				// Fetch aggregate stats (size, attachments) for the search results
 				// on the initial page load so the header metrics are accurate.
 				if err == nil && !appendResults {
-					statsOpts := query.StatsOptions{
-						SourceID:              m.searchFilter.SourceID,
-						WithAttachmentsOnly:   m.searchFilter.WithAttachmentsOnly,
-						HideDeletedFromSource: m.searchFilter.HideDeletedFromSource,
-						SearchQuery:           queryStr,
-						GroupBy:               m.viewType,
+					statsOpts, noMatches := deepSearchStatsOptions(mergedQuery, m.viewType)
+					if noMatches {
+						stats = &query.TotalStats{}
+					} else {
+						var statsErr error
+						stats, statsErr = m.engine.GetTotalStats(ctx, statsOpts)
+						if statsErr != nil {
+							slog.Warn("tui deep search stats failed",
+								"query_len", len(queryStr),
+								"error", statsErr.Error(),
+							)
+							fallbackCount := totalCount
+							if fallbackCount < 0 {
+								fallbackCount = int64(len(results))
+							}
+							stats = &query.TotalStats{MessageCount: fallbackCount}
+						}
 					}
-					stats, _ = m.engine.GetTotalStats(ctx, statsOpts)
 				}
 			}
 
 			return searchResultsMsg{
-				messages:   results,
-				totalCount: totalCount,
-				stats:      stats,
-				err:        err,
-				requestID:  requestID,
-				append:     appendResults,
+				messages:               results,
+				totalCount:             totalCount,
+				stats:                  stats,
+				err:                    err,
+				requestID:              requestID,
+				append:                 appendResults,
+				presentationGeneration: presentationGeneration,
 			}
 		},
 		func(r any) tea.Msg {
 			return searchResultsMsg{
-				err:       fmt.Errorf("search panic: %v", r),
-				requestID: requestID,
+				err:                    fmt.Errorf("search panic: %v", r),
+				requestID:              requestID,
+				presentationGeneration: presentationGeneration,
 			}
 		},
 	)
+}
+
+// deepSearchStatsOptions derives stats from the already-merged query used for
+// deep results. Search.Query cannot represent SenderName, RecipientName,
+// ConversationID, or empty aggregate buckets; MergeFilterIntoQuery deliberately
+// leaves those unsupported contexts out of both paths. A non-nil empty account
+// scope is the shared match-nothing signal for conflicting message types or an
+// explicitly empty collection.
+func deepSearchStatsOptions(merged *search.Query, groupBy query.ViewType) (query.StatsOptions, bool) {
+	opts := query.StatsOptions{
+		SearchQuery: search.Format(merged),
+		SearchScope: true,
+		GroupBy:     groupBy,
+	}
+	if merged == nil {
+		return opts, false
+	}
+	if merged.AccountIDs != nil && len(merged.AccountIDs) == 0 {
+		return opts, true
+	}
+	if len(merged.AccountIDs) == 1 {
+		sourceID := merged.AccountIDs[0]
+		opts.SourceID = &sourceID
+	} else if len(merged.AccountIDs) > 1 {
+		opts.SourceIDs = append([]int64(nil), merged.AccountIDs...)
+	}
+	opts.WithAttachmentsOnly = merged.HasAttachment != nil && *merged.HasAttachment
+	opts.HideDeletedFromSource = merged.HideDeleted
+	return opts, false
 }
 
 // buildMessageFilter constructs a MessageFilter from the current model state.
@@ -660,6 +748,7 @@ func (m Model) buildMessageFilter() query.MessageFilter {
 	filter.Sorting.Direction = m.msgSortDirection
 	filter.WithAttachmentsOnly = m.filters.attachmentsOnly
 	filter.HideDeletedFromSource = m.filters.hideDeletedFromSource
+	filter.MessageType = emailMessageType
 
 	// If not showing all messages and no drill filter, apply simple filter
 	if !m.allMessages && !m.hasDrillFilter() {
@@ -704,6 +793,7 @@ func (m Model) loadMessages() tea.Cmd {
 // is true, the results are appended to the existing message list.
 func (m Model) loadMessagesWithOffset(offset int, appendMode bool) tea.Cmd {
 	requestID := m.loadRequestID
+	presentationGeneration := m.presentationGeneration
 	scopeLabel := m.scopeLabelForLog()
 	searchTerm := m.searchQuery
 	return safeCmdWithPanic(
@@ -733,10 +823,16 @@ func (m Model) loadMessagesWithOffset(offset int, appendMode bool) tea.Cmd {
 					"duration_ms", time.Since(start).Milliseconds(),
 				)
 			}
-			return messagesLoadedMsg{messages: messages, err: err, requestID: requestID, append: appendMode}
+			return messagesLoadedMsg{
+				messages: messages, err: err, requestID: requestID, append: appendMode,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 		func(r any) tea.Msg {
-			return messagesLoadedMsg{err: fmt.Errorf("messages panic: %v", r), requestID: requestID}
+			return messagesLoadedMsg{
+				err: fmt.Errorf("messages panic: %v", r), requestID: requestID,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 	)
 }
@@ -781,11 +877,13 @@ func (m Model) drillFilterKey() string {
 // loadThreadMessages fetches all messages in a conversation/thread.
 func (m Model) loadThreadMessages(conversationID int64) tea.Cmd {
 	requestID := m.loadRequestID
+	presentationGeneration := m.presentationGeneration
 	threadLimit := m.threadMessageLimit
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			filter := query.MessageFilter{
 				ConversationID: &conversationID,
+				MessageType:    emailMessageType,
 				Sorting:        query.MessageSorting{Field: query.MessageSortByDate, Direction: query.SortAsc},
 				Pagination:     query.Pagination{Limit: threadLimit + 1}, // Request one extra to detect truncation
 			}
@@ -799,32 +897,61 @@ func (m Model) loadThreadMessages(conversationID int64) tea.Cmd {
 			}
 
 			return threadMessagesLoadedMsg{
-				messages:       messages,
-				conversationID: conversationID,
-				truncated:      truncated,
-				err:            err,
-				requestID:      requestID,
+				messages:               messages,
+				conversationID:         conversationID,
+				truncated:              truncated,
+				err:                    err,
+				requestID:              requestID,
+				presentationGeneration: presentationGeneration,
 			}
 		},
 		func(r any) tea.Msg {
 			return threadMessagesLoadedMsg{
-				err:       fmt.Errorf("thread messages panic: %v", r),
-				requestID: requestID,
+				err:                    fmt.Errorf("thread messages panic: %v", r),
+				requestID:              requestID,
+				presentationGeneration: presentationGeneration,
 			}
 		},
 	)
 }
 
+// emailScopedMessageFilter applies the Email-mode contract at the engine
+// boundary. Keeping this out of hasDrillFilter means the mandatory mode scope
+// does not make every top-level view look like a user-selected drill-down.
+func emailScopedMessageFilter(filter query.MessageFilter) query.MessageFilter {
+	filter.MessageType = emailMessageType
+	return filter
+}
+
+// emailScopedSearchQuery intersects a parsed aggregate search with Email mode.
+// A non-nil empty account scope is MergeFilterIntoQuery's match-nothing signal
+// for conflicting message types.
+func emailScopedSearchQuery(raw string) (string, bool) {
+	merged := query.MergeFilterIntoQuery(
+		search.Parse(raw),
+		query.MessageFilter{MessageType: emailMessageType},
+	)
+	noMatches := merged.AccountIDs != nil && len(merged.AccountIDs) == 0
+	return search.Format(merged), noMatches
+}
+
 // loadMessageDetail fetches a single message's full details.
 func (m Model) loadMessageDetail(id int64) tea.Cmd {
 	requestID := m.detailRequestID
+	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			detail, err := m.engine.GetMessage(context.Background(), id)
-			return messageDetailLoadedMsg{detail: detail, err: err, requestID: requestID}
+			return messageDetailLoadedMsg{
+				detail: detail, err: err, requestID: requestID,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 		func(r any) tea.Msg {
-			return messageDetailLoadedMsg{err: fmt.Errorf("message detail panic: %v", r), requestID: requestID}
+			return messageDetailLoadedMsg{
+				err: fmt.Errorf("message detail panic: %v", r), requestID: requestID,
+				presentationGeneration: presentationGeneration,
+			}
 		},
 	)
 }
@@ -854,6 +981,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeyPress(msg)
 	case tea.BackgroundColorMsg:
 		m.styles = newStyles(msg.IsDark())
+		m.markdownCache.setDark(msg.IsDark())
 		return m, nil
 	case tea.WindowSizeMsg:
 		return m.handleWindowSize(msg)
@@ -892,18 +1020,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleTextSearchResult(msg)
 	case textStatsLoadedMsg:
 		return m.handleTextStatsLoaded(msg)
+	case meetingMessagesLoadedMsg:
+		return m.handleMeetingMessagesLoaded(msg)
+	case meetingSearchLoadedMsg:
+		return m.handleMeetingSearchLoaded(msg)
+	case meetingDetailLoadedMsg:
+		return m.handleMeetingDetailLoaded(msg)
 	}
 	return m, nil
 }
 
-// handleTextConversationsLoaded processes text conversations load completion.
-func (m Model) handleTextConversationsLoaded(msg textConversationsLoadedMsg) (tea.Model, tea.Cmd) {
+// finishModePresentation settles shared loading state only when the response
+// belongs to the mode currently on screen. The response handler may still
+// cache mode-owned data while another mode is active.
+func (m *Model) finishModePresentation(mode tuiMode, generation uint64) bool {
+	if m.mode != mode || m.presentationGeneration != generation {
+		return false
+	}
 	m.transitionBuffer = ""
 	m.loading = false
+	return true
+}
+
+// handleTextConversationsLoaded processes text conversations load completion.
+func (m Model) handleTextConversationsLoaded(msg textConversationsLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.requestID != m.textRequestID {
+		return m, nil
+	}
+	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = msg.err
-		m.modal = modalError
-		m.modalResult = msg.err.Error()
+		if active {
+			m.err = msg.err
+			m.modal = modalError
+			m.modalResult = msg.err.Error()
+		}
 		return m, nil
 	}
 	m.textState.conversations = msg.conversations
@@ -916,12 +1066,16 @@ func (m Model) handleTextConversationsLoaded(msg textConversationsLoadedMsg) (te
 
 // handleTextAggregateLoaded processes text aggregate load completion.
 func (m Model) handleTextAggregateLoaded(msg textAggregateLoadedMsg) (tea.Model, tea.Cmd) {
-	m.transitionBuffer = ""
-	m.loading = false
+	if msg.requestID != m.textRequestID {
+		return m, nil
+	}
+	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = msg.err
-		m.modal = modalError
-		m.modalResult = msg.err.Error()
+		if active {
+			m.err = msg.err
+			m.modal = modalError
+			m.modalResult = msg.err.Error()
+		}
 		return m, nil
 	}
 	m.textState.aggregateRows = msg.rows
@@ -934,12 +1088,16 @@ func (m Model) handleTextAggregateLoaded(msg textAggregateLoadedMsg) (tea.Model,
 
 // handleTextMessagesLoaded processes text messages load completion.
 func (m Model) handleTextMessagesLoaded(msg textMessagesLoadedMsg) (tea.Model, tea.Cmd) {
-	m.transitionBuffer = ""
-	m.loading = false
+	if msg.requestID != m.textRequestID {
+		return m, nil
+	}
+	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = msg.err
-		m.modal = modalError
-		m.modalResult = msg.err.Error()
+		if active {
+			m.err = msg.err
+			m.modal = modalError
+			m.modalResult = msg.err.Error()
+		}
 		return m, nil
 	}
 	m.textState.messages = msg.messages
@@ -951,19 +1109,25 @@ func (m Model) handleTextMessagesLoaded(msg textMessagesLoadedMsg) (tea.Model, t
 
 // handleTextSearchResult processes text search results.
 func (m Model) handleTextSearchResult(msg textSearchResultMsg) (tea.Model, tea.Cmd) {
-	m.transitionBuffer = ""
-	m.loading = false
+	if msg.requestID != m.textRequestID {
+		return m, nil
+	}
+	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = msg.err
-		m.modal = modalError
-		m.modalResult = msg.err.Error()
+		if active {
+			m.err = msg.err
+			m.modal = modalError
+			m.modalResult = msg.err.Error()
+		}
 		return m, nil
 	}
 	// Show search results as a timeline
 	m.textState.messages = msg.messages
-	m.textState.level = textLevelTimeline
-	m.textState.cursor = 0
-	m.textState.scrollOffset = 0
+	if active {
+		m.textState.level = textLevelTimeline
+		m.textState.cursor = 0
+		m.textState.scrollOffset = 0
+	}
 	return m, nil
 }
 
@@ -1005,6 +1169,16 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 		}
 		m.clampDetailScroll()
 	}
+	if m.mode == modeMeetings && m.meetingState.level == meetingLevelDetail && m.meetingState.detail != nil {
+		if m.meetingState.detailSearchQuery != "" {
+			matchIndex := m.meetingState.detailSearchMatchIndex
+			m.findMeetingDetailMatches()
+			if len(m.meetingState.detailSearchMatches) > 0 {
+				m.meetingState.detailSearchMatchIndex = min(matchIndex, len(m.meetingState.detailSearchMatches)-1)
+			}
+		}
+		m.clampMeetingDetailScroll()
+	}
 	return m, nil
 }
 
@@ -1014,20 +1188,25 @@ func (m Model) handleDataLoaded(msg dataLoadedMsg) (tea.Model, tea.Cmd) {
 	if msg.requestID != m.aggregateRequestID {
 		return m, nil
 	}
-	m.transitionBuffer = "" // Unfreeze view now that data is ready
-	m.loading = false
-	m.inlineSearchLoading = false
+	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
+	if active {
+		m.inlineSearchLoading = false
+	}
 	if msg.err != nil {
-		m.err = query.HintRepairEncoding(msg.err)
-		m.modal = modalError
-		m.modalResult = m.err.Error()
+		if active {
+			m.err = query.HintRepairEncoding(msg.err)
+			m.modal = modalError
+			m.modalResult = m.err.Error()
+		}
 		m.restorePosition = false // Clear flag on error to prevent stale state
 		return m, nil
 	}
 
-	m.err = nil
-	if m.modal == modalError {
-		m.modal = modalNone
+	if active {
+		m.err = nil
+		if m.modal == modalError {
+			m.modal = modalNone
+		}
 	}
 	m.rows = msg.rows
 	// Only reset position on fresh loads, not when restoring from breadcrumb
@@ -1096,19 +1275,24 @@ func (m Model) handleMessagesLoaded(msg messagesLoadedMsg) (tea.Model, tea.Cmd) 
 	if msg.requestID != m.loadRequestID {
 		return m, nil
 	}
-	m.transitionBuffer = "" // Unfreeze view now that data is ready
-	m.loading = false
-	m.inlineSearchLoading = false
+	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
+	if active {
+		m.inlineSearchLoading = false
+	}
 	m.msgListLoadingMore = false
 	if msg.err != nil {
-		m.err = query.HintRepairEncoding(msg.err)
-		m.modal = modalError
-		m.modalResult = m.err.Error()
+		if active {
+			m.err = query.HintRepairEncoding(msg.err)
+			m.modal = modalError
+			m.modalResult = m.err.Error()
+		}
 		m.restorePosition = false // Clear flag on error to prevent stale state
 	} else {
-		m.err = nil
-		if m.modal == modalError {
-			m.modal = modalNone
+		if active {
+			m.err = nil
+			if m.modal == modalError {
+				m.modal = modalNone
+			}
 		}
 		if msg.append {
 			// Append paginated results to existing list
@@ -1139,16 +1323,19 @@ func (m Model) handleMessageDetailLoaded(msg messageDetailLoadedMsg) (tea.Model,
 	if msg.requestID != m.detailRequestID {
 		return m, nil
 	}
-	m.transitionBuffer = "" // Unfreeze view now that data is ready
-	m.loading = false
+	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = query.HintRepairEncoding(msg.err)
-		m.modal = modalError
-		m.modalResult = m.err.Error()
+		if active {
+			m.err = query.HintRepairEncoding(msg.err)
+			m.modal = modalError
+			m.modalResult = m.err.Error()
+		}
 	} else {
-		m.err = nil
-		if m.modal == modalError {
-			m.modal = modalNone
+		if active {
+			m.err = nil
+			if m.modal == modalError {
+				m.modal = modalNone
+			}
 		}
 		m.messageDetail = msg.detail
 		m.detailScroll = 0
@@ -1164,14 +1351,17 @@ func (m Model) handleThreadMessagesLoaded(msg threadMessagesLoadedMsg) (tea.Mode
 	if msg.requestID != m.loadRequestID {
 		return m, nil
 	}
-	m.transitionBuffer = "" // Unfreeze view now that data is ready
-	m.loading = false
+	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
 	if msg.err != nil {
-		m.err = query.HintRepairEncoding(msg.err)
-		m.modal = modalError
-		m.modalResult = m.err.Error()
+		if active {
+			m.err = query.HintRepairEncoding(msg.err)
+			m.modal = modalError
+			m.modalResult = m.err.Error()
+		}
 	} else {
-		m.err = nil
+		if active {
+			m.err = nil
+		}
 		m.threadMessages = msg.messages
 		m.threadConversationID = msg.conversationID
 		m.threadTruncated = msg.truncated
@@ -1188,20 +1378,25 @@ func (m Model) handleSearchResults(msg searchResultsMsg) (tea.Model, tea.Cmd) {
 	if msg.requestID != m.searchRequestID {
 		return m, nil
 	}
-	m.transitionBuffer = "" // Unfreeze view now that data is ready
-	m.loading = false
-	m.inlineSearchLoading = false
-	m.searchLoadingMore = false
+	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
+	if active {
+		m.inlineSearchLoading = false
+		m.searchLoadingMore = false
+	}
 	if msg.err != nil {
-		m.err = query.HintRepairEncoding(msg.err)
-		m.modal = modalError
-		m.modalResult = m.err.Error()
+		if active {
+			m.err = query.HintRepairEncoding(msg.err)
+			m.modal = modalError
+			m.modalResult = m.err.Error()
+		}
 		return m, nil
 	}
 
-	m.err = nil
-	if m.modal == modalError {
-		m.modal = modalNone
+	if active {
+		m.err = nil
+		if m.modal == modalError {
+			m.modal = modalNone
+		}
 	}
 	if msg.append {
 		m.appendSearchResults(msg)
@@ -1338,6 +1533,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Route to Texts mode handler when active
 	if m.mode == modeTexts {
 		return m.handleTextKeyPress(msg)
+	}
+	if m.mode == modeMeetings {
+		return m.handleMeetingKeyPress(msg)
 	}
 
 	// Handle modal first (error modals must dismiss even during search)
@@ -1546,6 +1744,9 @@ func (m Model) View() tea.View {
 func (m Model) renderView() string {
 	if m.mode == modeTexts {
 		return m.renderTextView()
+	}
+	if m.mode == modeMeetings {
+		return m.renderMeetingView()
 	}
 
 	switch m.level {

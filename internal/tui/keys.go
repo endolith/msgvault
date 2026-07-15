@@ -12,6 +12,7 @@ import (
 const (
 	keyNameEnter = "enter"
 	keyNameEsc   = "esc"
+	keyNameDown  = "down"
 )
 
 // handleInlineSearchKeys handles keys when inline search bar is active.
@@ -101,21 +102,41 @@ func (m Model) handleGlobalKeys(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.modal = modalHelp
 		return m, nil, true
 	case "m":
-		if m.textEngine == nil {
-			return m, nil, true
-		}
-		if m.mode == modeEmail {
-			m.mode = modeTexts
+		m.presentationGeneration++
+		m.mode = nextMode(m.mode, m.textEngine != nil)
+		// A frozen view and the email search loading flags describe the mode
+		// being left. Do not let them obscure or animate the destination mode.
+		m.transitionBuffer = ""
+		m.inlineSearchLoading = false
+		m.searchLoadingMore = false
+		switch m.mode {
+		case modeTexts:
 			m.textState.filter.SourceID = m.accountFilter
 			m.loading = true
 			spinCmd := m.startSpinner()
-			return m, tea.Batch(spinCmd, m.loadTextConversations()), true
+			loadCmd := m.loadTextConversations()
+			return m, tea.Batch(spinCmd, loadCmd), true
+		case modeMeetings:
+			m.meetingState.listLoading = false
+			m.meetingState.searchLoading = false
+			m.meetingState.detailLoading = false
+			if m.meetingState.initialized {
+				m.loading = false
+				return m, nil, true
+			}
+			m.loading = true
+			m.meetingState.requestID++
+			m.meetingState.listLoading = true
+			m.meetingState.preSearch = nil
+			m.meetingState.searchSnapshotInvalid = true
+			spinCmd := m.startSpinner()
+			return m, tea.Batch(spinCmd, m.loadMeetingMessages()), true
+		default:
+			m.loading = true
+			m.aggregateRequestID++
+			spinCmd := m.startSpinner()
+			return m, tea.Batch(spinCmd, m.loadData(), m.loadStats()), true
 		}
-		m.mode = modeEmail
-		m.loading = true
-		m.aggregateRequestID++
-		spinCmd := m.startSpinner()
-		return m, tea.Batch(spinCmd, m.loadData(), m.loadStats()), true
 	}
 	return m, nil, false
 }
@@ -735,7 +756,7 @@ func (m Model) handleMessageDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		} else {
 			return m.showFlash("At top")
 		}
-	case "down", "j":
+	case keyNameDown, "j":
 		// Clamp first in case scroll is out of range after resize
 		m.clampDetailScroll()
 		maxScroll := max(m.detailLineCount-m.detailPageSize(), 0)
@@ -824,7 +845,7 @@ func (m Model) handleThreadViewKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.threadCursor--
 			m.ensureThreadCursorVisible()
 		}
-	case "down", "j":
+	case keyNameDown, "j":
 		if m.threadCursor < len(m.threadMessages)-1 {
 			m.threadCursor++
 			m.ensureThreadCursorVisible()
@@ -937,29 +958,63 @@ func (m Model) handleQuitConfirmKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	maxIdx := len(m.accounts) // 0 = All Accounts, then accounts
+	accounts := m.selectableAccounts()
+	maxIdx := len(accounts) // 0 = All Accounts/Sources, then selectable sources
 	switch msg.String() {
 	case "up", "k":
 		if m.modalCursor > 0 {
 			m.modalCursor--
 		}
-	case "down", "j":
+	case keyNameDown, "j":
 		if m.modalCursor < maxIdx {
 			m.modalCursor++
 		}
 	case keyNameEnter:
 		// Apply selection with bounds check
-		if m.modalCursor == 0 || m.modalCursor > len(m.accounts) {
-			m.accountFilter = nil // All accounts (or fallback if out of bounds)
+		var selectedID *int64
+		if m.modalCursor > 0 && m.modalCursor <= len(accounts) {
+			accID := accounts[m.modalCursor-1].ID
+			selectedID = &accID
+		}
+		if m.mode == modeMeetings {
+			m.meetingState.sourceID = selectedID
 		} else {
-			accID := m.accounts[m.modalCursor-1].ID
-			m.accountFilter = &accID
+			m.accountFilter = selectedID
 		}
 		m.modal = modalNone
 		m.loading = true
+		if m.mode == modeMeetings {
+			m.meetingState.requestID++
+			m.meetingState.searchRequestID++
+			m.meetingState.listOffset = 0
+			m.meetingState.listComplete = false
+			m.meetingState.listLoadingMore = false
+			m.meetingState.listLoading = false
+			m.meetingState.searchLoading = false
+			m.meetingState.searchOffset = 0
+			m.meetingState.searchComplete = false
+			m.meetingState.cursor = 0
+			m.meetingState.scrollOffset = 0
+			// A pre-search snapshot belongs to the previous source and must
+			// never be restored after the source changes.
+			m.meetingState.preSearch = nil
+			if m.meetingState.searchQuery != "" {
+				m.meetingState.searchSnapshotInvalid = true
+				m.meetingState.searchLoading = true
+				spinCmd := m.startSpinner()
+				return m, tea.Batch(
+					spinCmd,
+					m.loadMeetingSearch(m.meetingState.searchQuery, 0, false),
+				)
+			}
+			m.meetingState.searchSnapshotInvalid = true
+			m.meetingState.listLoading = true
+			return m, m.loadMeetingMessages()
+		}
 		if m.mode == modeTexts {
 			m.textState.filter.SourceID = m.accountFilter
-			return m, m.loadTextData()
+			cmd := m.loadTextData()
+			return m, cmd
 		}
 		m.aggregateRequestID++
 		return m, tea.Batch(m.loadData(), m.loadStats())
@@ -978,7 +1033,7 @@ func (m Model) handleFilterToggleKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		if m.modalCursor > 0 {
 			m.modalCursor--
 		}
-	case "down", "j":
+	case keyNameDown, "j":
 		if m.modalCursor < filterOptionCount-1 {
 			m.modalCursor++
 		}
@@ -1023,7 +1078,7 @@ func (m Model) handleExportAttachmentsKeys(msg tea.KeyPressMsg) (tea.Model, tea.
 		if m.exportCursor > 0 {
 			m.exportCursor--
 		}
-	case "down", "j":
+	case keyNameDown, "j":
 		if m.exportCursor < maxIdx {
 			m.exportCursor++
 		}
@@ -1063,7 +1118,7 @@ func (m Model) handleErrorKeys() (tea.Model, tea.Cmd) {
 
 func (m Model) handleHelpKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "down", "j":
+	case keyNameDown, "j":
 		m.helpScroll++
 	case "up", "k":
 		if m.helpScroll > 0 {
@@ -1083,7 +1138,7 @@ func (m Model) handleHelpKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	// Clamp scroll to prevent overscroll
-	if maxScroll := len(rawHelpLines) - m.helpMaxVisible(); maxScroll > 0 {
+	if maxScroll := len(m.activeHelpLines()) - m.helpMaxVisible(); maxScroll > 0 {
 		if m.helpScroll > maxScroll {
 			m.helpScroll = maxScroll
 		}
@@ -1234,17 +1289,22 @@ func (m Model) enterDrillDown(row query.AggregateRow) (tea.Model, tea.Cmd) {
 
 func (m *Model) openAccountSelector() {
 	m.modal = modalAccountSelector
-	m.modalCursor = 0 // Default to "All Accounts"
-	if m.accountFilter != nil {
-		for i, acc := range m.accounts {
-			if acc.ID == *m.accountFilter {
+	m.modalCursor = 0 // Default to "All Accounts" / "All Sources"
+	selectedID := m.accountFilter
+	if m.mode == modeMeetings {
+		selectedID = m.meetingState.sourceID
+	}
+	accounts := m.selectableAccounts()
+	if selectedID != nil {
+		for i, acc := range accounts {
+			if acc.ID == *selectedID {
 				m.modalCursor = i + 1 // +1 because 0 is "All Accounts"
 				break
 			}
 		}
 	}
 	// Clamp to valid range in case accounts list changed
-	if m.modalCursor > len(m.accounts) {
+	if m.modalCursor > len(accounts) {
 		m.modalCursor = 0
 	}
 }

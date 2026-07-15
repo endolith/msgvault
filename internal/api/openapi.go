@@ -37,7 +37,13 @@ import (
 // 1.4.0: vector/hybrid search adds offset pagination, has_more, and opt-in
 // scored chunk matches. Additive (minor bump): existing summary-only callers
 // retain their request and response behavior.
-const APISchemaVersion = "1.4.0"
+//
+// 1.5.0 adds source IDs to message summaries, source filters and capability
+// echoes to fast search, and the search_scope/source filters plus capability
+// echoes to total statistics. The echoes let remote clients fail closed when
+// a released older daemon ignores an additive request filter.
+// Additive (minor bump): the major-version compatibility gate stays at 1.
+const APISchemaVersion = "1.5.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.

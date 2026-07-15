@@ -112,7 +112,10 @@ type TextStatsOptions struct {
 	SearchQuery string
 }
 
-const messageTypeSMS = "sms"
+const (
+	messageTypeSMS               = "sms"
+	messageTypeMeetingTranscript = "meeting_transcript"
+)
 
 // TextMessageTypes lists the message_type values included in Texts mode.
 var TextMessageTypes = []string{
@@ -151,6 +154,7 @@ func IsTextMessageType(mt string) bool {
 var KnownMessageTypes = []string{
 	messageTypeEmail,
 	"calendar_event",
+	messageTypeMeetingTranscript,
 	messageTypeSMS,
 	"mms",
 	"whatsapp",

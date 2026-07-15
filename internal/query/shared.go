@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -31,6 +32,24 @@ const emailOnlyFilterMsg = "(msg.message_type = '" + messageTypeEmail + "' OR ms
 // emailOnlyFilterM is the SQL condition restricting to email messages with "m." alias (SQLite).
 // NULL and empty string handle old data where message_type was not yet populated.
 const emailOnlyFilterM = "(m.message_type = '" + messageTypeEmail + "' OR m.message_type IS NULL OR m.message_type = '')"
+
+// hasExplicitMessageTypeSearch reports whether a parsed search query selects
+// one or more message types. Default analytics use this to apply the positive
+// email-only predicate without overriding an explicit message-type scope.
+func hasExplicitMessageTypeSearch(searchQuery string) bool {
+	if searchQuery == "" {
+		return false
+	}
+	return len(search.Parse(searchQuery).MessageTypes) > 0
+}
+
+// shouldDefaultStatsToEmail reports whether a generic stats query should use
+// the positive email-only default. Search result stats opt into the same broad
+// message-type scope as search, while an explicit message_type remains
+// authoritative in either mode.
+func shouldDefaultStatsToEmail(opts StatsOptions) bool {
+	return !opts.SearchScope && !hasExplicitMessageTypeSearch(opts.SearchQuery)
+}
 
 // participantNameExpr returns the SQL expression for a participant's display
 // label, falling back through display_name → phone_number → email_address.
@@ -373,6 +392,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			m.source_message_id,
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
@@ -393,6 +413,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 	var sentAt, receivedAt, deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, rebind(query), args...).Scan(
 		&msg.ID,
+		&msg.SourceID,
 		&msg.SourceMessageID,
 		&msg.ConversationID,
 		&msg.SourceConversationID,

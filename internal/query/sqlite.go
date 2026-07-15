@@ -251,18 +251,14 @@ func optsToFilterConditions(d Dialect, opts AggregateOptions, prefix string) ([]
 	conditions, args = appendSourceFilter(
 		conditions, args, prefix, opts.SourceID, opts.SourceIDs,
 	)
-	// Bind time.Time values directly. Formatting to a naive
-	// "2006-01-02 15:04:05" string and binding that to a PG TIMESTAMPTZ
-	// column parses the string in session TimeZone (not UTC); pgx
-	// encodes time.Time correctly on both backends, and go-sqlite3
-	// formats it to a sortable RFC3339-with-fractional layout.
+	// Normalize absolute instants through the active backend dialect.
 	if opts.After != nil {
-		conditions = append(conditions, prefix+"sent_at >= ?")
-		args = append(args, *opts.After)
+		conditions = append(conditions, d.DateComparison(prefix+"sent_at", ">="))
+		args = append(args, d.DateParam(*opts.After))
 	}
 	if opts.Before != nil {
-		conditions = append(conditions, prefix+"sent_at < ?")
-		args = append(args, *opts.Before)
+		conditions = append(conditions, d.DateComparison(prefix+"sent_at", "<"))
+		args = append(args, d.DateParam(*opts.Before))
 	}
 	if opts.WithAttachmentsOnly {
 		conditions = append(conditions, d.BoolTrueExpr(prefix+"has_attachments"))
@@ -334,13 +330,13 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 	}
 
 	if filter.After != nil {
-		conditions = append(conditions, prefix+"sent_at >= ?")
-		args = append(args, *filter.After)
+		conditions = append(conditions, e.dialect.DateComparison(prefix+"sent_at", ">="))
+		args = append(args, e.dialect.DateParam(*filter.After))
 	}
 
 	if filter.Before != nil {
-		conditions = append(conditions, prefix+"sent_at < ?")
-		args = append(args, *filter.Before)
+		conditions = append(conditions, e.dialect.DateComparison(prefix+"sent_at", "<"))
+		args = append(args, e.dialect.DateParam(*filter.Before))
 	}
 
 	if filter.WithAttachmentsOnly {
@@ -815,6 +811,7 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			m.source_message_id,
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
@@ -854,6 +851,7 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 		var deletedAt sql.NullTime
 		if err := rows.Scan(
 			&msg.ID,
+			&msg.SourceID,
 			&msg.SourceMessageID,
 			&msg.ConversationID,
 			&msg.SourceConversationID,
@@ -917,6 +915,7 @@ func (e *SQLiteEngine) GetMessageSummariesByIDs(ctx context.Context, ids []int64
 	q := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			m.source_message_id,
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
@@ -951,6 +950,7 @@ func (e *SQLiteEngine) GetMessageSummariesByIDs(ctx context.Context, ids []int64
 		var deletedAt sql.NullTime
 		if err := rows.Scan(
 			&msg.ID,
+			&msg.SourceID,
 			&msg.SourceMessageID,
 			&msg.ConversationID,
 			&msg.SourceConversationID,
@@ -1110,10 +1110,8 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	var searchConditions []string
 	var searchArgs []any
 	var searchFTSJoin string
-	hasSearchMessageTypes := false
 	if opts.SearchQuery != "" {
 		q := search.Parse(opts.SearchQuery)
-		hasSearchMessageTypes = len(q.MessageTypes) > 0
 		searchConditions, searchArgs, searchFTSJoin = e.buildSearchQueryParts(ctx, q)
 	}
 
@@ -1121,10 +1119,11 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	// the messages table for compatibility with search joins.
 	var conditions []string
 	var args []any
-	// Restrict to email messages only; NULL and '' handle pre-message_type data.
+	// Generic analytics default to email; search-result stats opt into the
+	// broader search scope. NULL and '' are legacy email rows.
 	// Exclude rows soft-deleted by deduplicate; gate source-deleted on
 	// opts.HideDeletedFromSource via the helper.
-	if !hasSearchMessageTypes {
+	if shouldDefaultStatsToEmail(opts) {
 		conditions = append(conditions, emailOnlyFilterM)
 	}
 	conditions = append(conditions, store.LiveMessagesWhere("m", opts.HideDeletedFromSource))
@@ -1149,6 +1148,9 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	joinClause := ""
 	if searchFTSJoin != "" {
 		joinClause += searchFTSJoin + "\n"
+	}
+	if statsUseMatchingPopulation(opts) {
+		return e.getSearchMatchStats(ctx, conditions, args, searchFTSJoin)
 	}
 
 	// Message stats — when the FTS join is present, use a subquery so the
@@ -1245,6 +1247,15 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	return stats, nil
 }
 
+func statsUseMatchingPopulation(opts StatsOptions) bool {
+	return opts.SearchScope ||
+		opts.SourceID != nil ||
+		opts.SourceIDs != nil ||
+		opts.WithAttachmentsOnly ||
+		opts.HideDeletedFromSource ||
+		opts.SearchQuery != ""
+}
+
 // GetGmailIDsByFilter returns Gmail message IDs (source_message_id) matching a filter.
 // This is more efficient than ListMessages when you only need the IDs.
 //
@@ -1266,6 +1277,13 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	conditions = append(conditions, store.LiveMessagesWhere("m", true))
 
 	conditions, args = appendSourceFilter(conditions, args, "m.", filter.SourceID, filter.SourceIDs)
+	if filter.MessageType != "" {
+		condition, conditionArgs := sqliteMessageTypeCondition("m", []string{filter.MessageType})
+		if condition != "" {
+			conditions = append(conditions, condition)
+			args = append(args, conditionArgs...)
+		}
+	}
 
 	// Scope to Gmail sources only — this function is used for
 	// Gmail-specific deletion/staging workflows and must not return
@@ -1407,12 +1425,12 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	}
 
 	if filter.After != nil {
-		conditions = append(conditions, "m.sent_at >= ?")
-		args = append(args, *filter.After)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", ">="))
+		args = append(args, e.dialect.DateParam(*filter.After))
 	}
 	if filter.Before != nil {
-		conditions = append(conditions, "m.sent_at < ?")
-		args = append(args, *filter.Before)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", "<"))
+		args = append(args, e.dialect.DateParam(*filter.Before))
 	}
 
 	// Build query - only add LIMIT if explicitly set. DISTINCT is not
@@ -1584,12 +1602,12 @@ func (e *SQLiteEngine) SearchByDomains(ctx context.Context, domains []string, af
 	)`, strings.Join(placeholders, ", ")))
 
 	if after != nil {
-		conditions = append(conditions, "m.sent_at >= ?")
-		args = append(args, *after)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", ">="))
+		args = append(args, e.dialect.DateParam(*after))
 	}
 	if before != nil {
-		conditions = append(conditions, "m.sent_at < ?")
-		args = append(args, *before)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", "<"))
+		args = append(args, e.dialect.DateParam(*before))
 	}
 
 	if limit <= 0 {
@@ -1726,20 +1744,16 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		conditions = append(conditions, e.dialect.BoolTrueExpr("m.has_attachments"))
 	}
 
-	// Date range filters. Bind time.Time directly rather than a naive
-	// "2006-01-02 15:04:05" string: a formatted, offset-less string compared
-	// against a PG TIMESTAMPTZ column is parsed in the session TimeZone (not
-	// UTC), shifting the boundary under any non-UTC session. pgx encodes
-	// time.Time with an explicit offset (timezone-stable), and go-sqlite3
-	// serializes it to a sortable RFC3339 layout, so SQLite stays correct.
-	// Matches optsToFilterConditions / the store search path. [cr2-9]
+	// Date range filters use backend-native instant comparisons. PostgreSQL
+	// retains typed TIMESTAMPTZ comparisons; SQLite parses both operands so
+	// mixed UTC and offset-bearing DATETIME strings compare chronologically.
 	if q.AfterDate != nil {
-		conditions = append(conditions, "m.sent_at >= ?")
-		args = append(args, *q.AfterDate)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", ">="))
+		args = append(args, e.dialect.DateParam(*q.AfterDate))
 	}
 	if q.BeforeDate != nil {
-		conditions = append(conditions, "m.sent_at < ?")
-		args = append(args, *q.BeforeDate)
+		conditions = append(conditions, e.dialect.DateComparison("m.sent_at", "<"))
+		args = append(args, e.dialect.DateParam(*q.BeforeDate))
 	}
 
 	// Size filters
@@ -1917,6 +1931,7 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			m.source_message_id,
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
@@ -1956,6 +1971,7 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 		var deletedAt sql.NullTime
 		if err := rows.Scan(
 			&msg.ID,
+			&msg.SourceID,
 			&msg.SourceMessageID,
 			&msg.ConversationID,
 			&msg.SourceConversationID,
@@ -2175,10 +2191,10 @@ func (e *SQLiteEngine) executeSearchCount(ctx context.Context, conditions []stri
 	return count, nil
 }
 
-// getMetadataSearchStats computes every aggregate from the same metadata-only
-// predicate used by SearchFast and SearchFastCount. Generic GetTotalStats keeps
-// its composite full-text semantics for its independent public contract.
-func (e *SQLiteEngine) getMetadataSearchStats(ctx context.Context, conditions []string, args []any, ftsJoin string) (*TotalStats, error) {
+// getSearchMatchStats computes every aggregate from one matching-message
+// predicate. SearchFast supplies its metadata-only predicate; search-scoped
+// GetTotalStats supplies its composite predicate, including body FTS matches.
+func (e *SQLiteEngine) getSearchMatchStats(ctx context.Context, conditions []string, args []any, ftsJoin string) (*TotalStats, error) {
 	whereClause := strings.Join(conditions, " AND ")
 	if whereClause == "" {
 		whereClause = "1=1"
@@ -2213,7 +2229,7 @@ func (e *SQLiteEngine) getMetadataSearchStats(ctx context.Context, conditions []
 		&stats.TotalSize,
 		&stats.AccountCount,
 	); err != nil {
-		return nil, fmt.Errorf("metadata search message stats: %w", err)
+		return nil, fmt.Errorf("search match message stats: %w", err)
 	}
 
 	attachmentStatsQuery := fmt.Sprintf(`
@@ -2226,7 +2242,7 @@ func (e *SQLiteEngine) getMetadataSearchStats(ctx context.Context, conditions []
 		&stats.AttachmentCount,
 		&stats.AttachmentSize,
 	); err != nil {
-		return nil, fmt.Errorf("metadata search attachment stats: %w", err)
+		return nil, fmt.Errorf("search match attachment stats: %w", err)
 	}
 
 	labelStatsQuery := fmt.Sprintf(`
@@ -2237,7 +2253,7 @@ func (e *SQLiteEngine) getMetadataSearchStats(ctx context.Context, conditions []
 		JOIN search_matches sm ON sm.id = ml.message_id
 	`, searchMatches)
 	if err := e.queryRowContext(ctx, labelStatsQuery, args...).Scan(&stats.LabelCount); err != nil {
-		return nil, fmt.Errorf("metadata search label stats: %w", err)
+		return nil, fmt.Errorf("search match label stats: %w", err)
 	}
 
 	return stats, nil
@@ -2261,7 +2277,7 @@ func (e *SQLiteEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 		count = -1
 	}
 
-	stats, _ := e.getMetadataSearchStats(ctx, conditions, args, ftsJoin)
+	stats, _ := e.getSearchMatchStats(ctx, conditions, args, ftsJoin)
 
 	return &SearchFastResult{
 		Messages:   results,

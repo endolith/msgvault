@@ -48,6 +48,7 @@ const participantSummarySenderSQL = participantDisplaySQL + ` as from_display,
 // APIMessage represents a message for API responses.
 type APIMessage struct {
 	ID                   int64
+	SourceID             int64
 	SourceMessageID      string
 	ConversationID       int64
 	SourceConversationID string
@@ -109,6 +110,7 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int) ([]A
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
@@ -174,6 +176,7 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
@@ -204,6 +207,7 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 	var sentAt, deletedAt nullableTimestamp
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&m.ID,
+		&m.SourceID,
 		&m.SourceMessageID,
 		&m.ConversationID,
 		&m.SourceConversationID,
@@ -327,6 +331,7 @@ func (s *Store) GetMessagesSummariesByIDsContext(ctx context.Context, ids []int6
 	q := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
@@ -622,24 +627,23 @@ func (s *Store) searchMessagesQueryImpl(
 	}
 
 	// after: / before:
-	// Bind time.Time directly rather than an RFC3339 ('T'-separated) string.
-	// The *time.Time bind is correct on BOTH backends — pgx encodes it as a
-	// TIMESTAMPTZ value (RFC3339 already carries the 'Z' offset, so the old
-	// string bind was fine on PG too) and go-sqlite3 serializes it to the
-	// sortable layout matching how sent_at was stored. The bug this fixes was
-	// SQLite-only: comparing an RFC3339 string against SQLite's space-separated
-	// stored timestamps put the 'T' (0x54) after the space (0x20), shifting the
-	// day boundary. Binding time.Time also keeps this store API consistent with
-	// the query engine, which binds time.Time the same way. [cr2-9]
+	// PostgreSQL compares typed TIMESTAMPTZ values directly. SQLite archives can
+	// contain both UTC and offset-bearing timestamp strings, so compare Julian
+	// day values instead of their lexical encodings. Normalizing the bound to UTC
+	// keeps the argument stable on both backends. [cr2-9]
+	timestampExpr := "COALESCE(m.sent_at, m.received_at, m.internal_date)"
+	boundExpr := "?"
+	if !s.IsPostgreSQL() {
+		timestampExpr = "julianday(" + timestampExpr + ")"
+		boundExpr = "julianday(?)"
+	}
 	if q.AfterDate != nil {
-		conditions = append(conditions,
-			"COALESCE(m.sent_at, m.received_at, m.internal_date) >= ?")
-		args = append(args, *q.AfterDate)
+		conditions = append(conditions, timestampExpr+" >= "+boundExpr)
+		args = append(args, q.AfterDate.UTC())
 	}
 	if q.BeforeDate != nil {
-		conditions = append(conditions,
-			"COALESCE(m.sent_at, m.received_at, m.internal_date) < ?")
-		args = append(args, *q.BeforeDate)
+		conditions = append(conditions, timestampExpr+" < "+boundExpr)
+		args = append(args, q.BeforeDate.UTC())
 	}
 
 	whereClause := strings.Join(conditions, " AND ")
@@ -668,6 +672,7 @@ func (s *Store) searchMessagesQueryImpl(
 	searchSQL := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
@@ -765,6 +770,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	searchQuery := fmt.Sprintf(`
 		SELECT
 			m.id,
+			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
@@ -852,7 +858,7 @@ func (n *nullableTimestamp) Scan(src any) error {
 }
 
 // scanMessageRows scans the standard message row set
-// (id, source_message_id, conversation_id, source_conversation_id, subject,
+// (id, source_id, source_message_id, conversation_id, source_conversation_id, subject,
 // message_type, from_display, from_email, from_name, from_phone, sent_at,
 // snippet, has_attachments, size_estimate). All SELECT statements that feed
 // this scanner must produce the same column order.
@@ -869,6 +875,7 @@ func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 		var sentAt nullableTimestamp
 		err := rows.Scan(
 			&m.ID,
+			&m.SourceID,
 			&m.SourceMessageID,
 			&m.ConversationID,
 			&m.SourceConversationID,

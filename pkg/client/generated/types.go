@@ -346,6 +346,7 @@ type CLIQueryMessageSummary struct {
 	SizeEstimate         int64      `json:"size_estimate"`
 	Snippet              string     `json:"snippet" validate:"required"`
 	SourceConversationID string     `json:"source_conversation_id" validate:"required"`
+	SourceID             *int64     `json:"source_id,omitempty"`
 	SourceMessageID      string     `json:"source_message_id" validate:"required"`
 	Subject              string     `json:"subject" validate:"required"`
 	To                   []Address  `json:"to,omitempty"`
@@ -1093,6 +1094,7 @@ type HybridSearchItem struct {
 	SentAt           string              `json:"sent_at" validate:"required"`
 	SizeBytes        int64               `json:"size_bytes"`
 	Snippet          string              `json:"snippet" validate:"required"`
+	SourceID         *int64              `json:"source_id,omitempty"`
 	SourceMessageID  *string             `json:"source_message_id,omitempty"`
 	Subject          string              `json:"subject" validate:"required"`
 	To               []string            `json:"to,omitempty" validate:"required"`
@@ -1285,6 +1287,7 @@ type MessageDetail struct {
 	SentAt          string           `json:"sent_at" validate:"required"`
 	SizeBytes       int64            `json:"size_bytes"`
 	Snippet         string           `json:"snippet" validate:"required"`
+	SourceID        *int64           `json:"source_id,omitempty"`
 	SourceMessageID *string          `json:"source_message_id,omitempty"`
 	Subject         string           `json:"subject" validate:"required"`
 	To              []string         `json:"to,omitempty" validate:"required"`
@@ -1364,6 +1367,7 @@ type MessageSummary struct {
 	SentAt          string   `json:"sent_at" validate:"required"`
 	SizeBytes       int64    `json:"size_bytes"`
 	Snippet         string   `json:"snippet" validate:"required"`
+	SourceID        *int64   `json:"source_id,omitempty"`
 	SourceMessageID *string  `json:"source_message_id,omitempty"`
 	Subject         string   `json:"subject" validate:"required"`
 	To              []string `json:"to,omitempty" validate:"required"`
@@ -1466,10 +1470,11 @@ type ScoreBreakdown struct {
 }
 
 type SearchFastResponse struct {
-	Messages   []MessageSummary    `json:"messages,omitempty" validate:"required"`
-	Query      string              `json:"query" validate:"required"`
-	Stats      *TotalStatsResponse `json:"stats,omitempty"`
-	TotalCount int64               `json:"total_count"`
+	AppliedSourceIds []int64             `json:"applied_source_ids,omitempty"`
+	Messages         []MessageSummary    `json:"messages,omitempty" validate:"required"`
+	Query            string              `json:"query" validate:"required"`
+	Stats            *TotalStatsResponse `json:"stats,omitempty"`
+	TotalCount       int64               `json:"total_count"`
 }
 
 func (s SearchFastResponse) Validate() error {
@@ -1921,14 +1926,16 @@ func (t TokenUploadRequest) Validate() error {
 }
 
 type TotalStatsResponse struct {
-	AccountCount          int64 `json:"account_count"`
-	ActiveMessages        int64 `json:"active_messages"`
-	AttachmentCount       int64 `json:"attachment_count"`
-	AttachmentSize        int64 `json:"attachment_size"`
-	LabelCount            int64 `json:"label_count"`
-	MessageCount          int64 `json:"message_count"`
-	SourceDeletedMessages int64 `json:"source_deleted_messages"`
-	TotalSize             int64 `json:"total_size"`
+	AccountCount          int64   `json:"account_count"`
+	ActiveMessages        int64   `json:"active_messages"`
+	AppliedSearchScope    *bool   `json:"applied_search_scope,omitempty"`
+	AppliedSourceIds      []int64 `json:"applied_source_ids,omitempty"`
+	AttachmentCount       int64   `json:"attachment_count"`
+	AttachmentSize        int64   `json:"attachment_size"`
+	LabelCount            int64   `json:"label_count"`
+	MessageCount          int64   `json:"message_count"`
+	SourceDeletedMessages int64   `json:"source_deleted_messages"`
+	TotalSize             int64   `json:"total_size"`
 }
 
 type UpdateRequest struct {
